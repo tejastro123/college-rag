@@ -4,21 +4,36 @@
 
 ## Quick Start
 
-### 1. Backend
-```powershell
-cd backend
-# Add your LLM API key to .env (GROQ_API_KEY for free tier)
-.venv\Scripts\python.exe -m uvicorn app.main:app --reload --port 8000
-```
+**Development (no Docker):**
 
-### 2. Frontend
 ```powershell
+# Terminal 1 — Backend
+cd backend
+python -m uvicorn app.main:app --reload --port 8000
+
+# Terminal 2 — Frontend
 cd frontend
 npm run dev
 ```
 
-Open **http://localhost:5173** — register and start chatting with your documents!
+Open `http://localhost:5173`
 
+**Production (Docker):**
+
+```powershell
+docker compose up --build
+```
+
+Opens at `http://localhost` (nginx → frontend, `/api` → backend).
+
+**Testing:**
+
+```powershell
+cd backend
+python -m pytest tests/ -v
+```
+
+**API docs** at `http://localhost:8000/docs`
 ---
 
 ## Architecture
@@ -91,4 +106,5 @@ GROQ_API_KEY=gsk_your_key_here
 | Duplicate document detection | ✅ |
 
 ## API Docs
+
 Visit `http://localhost:8000/docs` for full Swagger UI.
