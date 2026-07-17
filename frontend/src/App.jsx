@@ -14,6 +14,7 @@ const StudyToolsPage = lazy(() => import('./pages/StudyToolsPage'))
 const AdminDashboard = lazy(() => import('./pages/AdminDashboard'))
 const OrganizationSettings = lazy(() => import('./pages/OrganizationSettings'))
 const BillingPage = lazy(() => import('./pages/BillingPage'))
+const WebSearchPage = lazy(() => import('./pages/WebSearchPage'))
 
 function PageFallback() {
   return (
@@ -28,7 +29,18 @@ function PageFallback() {
 
 function PrivateRoute({ children }) {
   const token = useAuthStore((s) => s.token)
-  return token ? children : <Navigate to="/login" replace />
+  const user = useAuthStore((s) => s.user)
+  if (!token) return <Navigate to="/login" replace />
+  if (user?.role === 'admin') return <Navigate to="/admin" replace />
+  return children
+}
+
+function AdminRoute({ children }) {
+  const token = useAuthStore((s) => s.token)
+  const user = useAuthStore((s) => s.user)
+  if (!token) return <Navigate to="/login" replace />
+  if (user?.role !== 'admin') return <Navigate to="/chat" replace />
+  return children
 }
 
 export default function App() {
@@ -39,8 +51,8 @@ export default function App() {
           <Routes>
             <Route path="/login" element={<LoginPage />} />
             <Route path="/register" element={<RegisterPage />} />
+            <Route path="/admin" element={<AdminRoute><AdminDashboard /></AdminRoute>} />
             <Route path="/chat" element={<PrivateRoute><ChatLayout /></PrivateRoute>} />
-            <Route path="/admin" element={<PrivateRoute><AdminDashboard /></PrivateRoute>} />
             <Route path="/" element={<PrivateRoute><AppLayout /></PrivateRoute>}>
               <Route index element={<Navigate to="/chat" replace />} />
               <Route path="documents" element={<DocumentsPage />} />
@@ -48,6 +60,7 @@ export default function App() {
               <Route path="study" element={<StudyToolsPage />} />
               <Route path="org/:orgId" element={<OrganizationSettings />} />
               <Route path="billing" element={<BillingPage />} />
+              <Route path="web-search" element={<WebSearchPage />} />
             </Route>
           </Routes>
         </Suspense>

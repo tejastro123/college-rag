@@ -14,7 +14,7 @@ from fastapi.middleware.trustedhost import TrustedHostMiddleware
 
 from app.core.config import settings
 from app.core.logging import setup_logging, get_logger
-from app.db.database import init_db
+from app.db.database import init_db, seed_admin
 from app.api.v1.api import api_router
 
 setup_logging()
@@ -33,6 +33,12 @@ async def lifespan(app: FastAPI):
     # Initialize database
     await init_db()
     logger.info("Database initialized")
+
+    # Seed admin user
+    try:
+        await seed_admin()
+    except Exception as e:
+        logger.warning("Admin seed skipped", error=str(e))
 
     # Warm up vector store
     try:

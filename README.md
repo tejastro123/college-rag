@@ -81,30 +81,4 @@ LLM_PROVIDER=groq
 GROQ_API_KEY=gsk_your_key_here
 ```
 
-## Features
-
-| Feature | Status |
-|---------|--------|
-| PDF/DOCX/PPTX/TXT/MD parsing | ✅ |
-| OCR for scanned images | ✅ (requires Tesseract) |
-| Semantic vector search (ChromaDB) | ✅ |
-| BM25 keyword search | ✅ |
-| Hybrid RRF fusion | ✅ |
-| Cohere reranking | ✅ (optional) |
-| Multi-mode answers (strict/tutor/exam/revision) | ✅ |
-| Source citations with page numbers | ✅ |
-| Confidence scoring | ✅ |
-| Course organization | ✅ |
-| Flashcard generation | ✅ |
-| Quiz generation | ✅ |
-| Summary generation | ✅ |
-| Formula sheet extraction | ✅ |
-| Chat history | ✅ |
-| Conversation bookmarks | ✅ |
-| Follow-up question suggestions | ✅ |
-| JWT authentication | ✅ |
-| Duplicate document detection | ✅ |
-
-## API Docs
-
-Visit `http://localhost:8000/docs` for full Swagger UI.
+Login with <admin@collegerag.com> / admin123 returns role: admin.

@@ -13,6 +13,7 @@ from typing import AsyncGenerator, Optional
 from app.core.config import settings
 from app.core.logging import get_logger
 from app.retrieval.hybrid import RetrievedChunk
+from app.services.http_client import get_ollama_client
 
 logger = get_logger(__name__)
 
@@ -141,27 +142,24 @@ STUDENT QUERY: {query}{format_instructions}"""
         provider = settings.LLM_PROVIDER
 
         if provider == "ollama":
-            import httpx
-            async with httpx.AsyncClient(timeout=60.0) as client:
-                url = f"{settings.OLLAMA_BASE_URL.rstrip('/')}/api/chat"
-                payload = {
-                    "model": settings.OLLAMA_MODEL,
-                    "messages": [{"role": "system", "content": system_prompt}] + messages,
-                    "stream": False,
-                    "options": {
-                        "temperature": 0.3,
-                        "num_predict": 2000,
-                    }
+            client = get_ollama_client()
+            payload = {
+                "model": settings.OLLAMA_MODEL,
+                "messages": [{"role": "system", "content": system_prompt}] + messages,
+                "stream": False,
+                "options": {
+                    "temperature": 0.3,
+                    "num_predict": 2000,
                 }
-                response = await client.post(url, json=payload)
-                response.raise_for_status()
-                res_data = response.json()
-                answer = res_data.get("message", {}).get("content", "")
-                
-                # Ollama token usage metrics: prompt_eval_count (input) + eval_count (output)
-                prompt_tokens = res_data.get("prompt_eval_count", 0)
-                completion_tokens = res_data.get("eval_count", 0)
-                tokens_used = prompt_tokens + completion_tokens
+            }
+            response = await client.post("/api/chat", json=payload)
+            response.raise_for_status()
+            res_data = response.json()
+            answer = res_data.get("message", {}).get("content", "")
+            
+            prompt_tokens = res_data.get("prompt_eval_count", 0)
+            completion_tokens = res_data.get("eval_count", 0)
+            tokens_used = prompt_tokens + completion_tokens
 
         else:
             # Fallback: return context without LLM
@@ -241,35 +239,32 @@ STUDENT QUERY: {query}{format_instructions}"""
 
     try:
         if provider == "ollama":
-            import httpx
-            async with httpx.AsyncClient(timeout=120.0) as client:
-                url = f"{settings.OLLAMA_BASE_URL.rstrip('/')}/api/chat"
-                payload = {
-                    "model": settings.OLLAMA_MODEL,
-                    "messages": [{"role": "system", "content": system_prompt}] + messages,
-                    "stream": True,
-                    "options": {
-                        "temperature": 0.3,
-                        "num_predict": 2000,
-                    }
+            client = get_ollama_client()
+            payload = {
+                "model": settings.OLLAMA_MODEL,
+                "messages": [{"role": "system", "content": system_prompt}] + messages,
+                "stream": True,
+                "options": {
+                    "temperature": 0.3,
+                    "num_predict": 2000,
                 }
-                async with client.stream("POST", url, json=payload) as response:
-                    response.raise_for_status()
-                    async for line in response.aiter_lines():
-                        if not line.strip():
-                            continue
-                        try:
-                            data = json.loads(line)
-                        except json.JSONDecodeError:
-                            continue
-                        if "message" in data and "content" in data["message"]:
-                            token = data["message"]["content"]
-                            answer_parts.append(token)
-                            yield f"data: {json.dumps({'type': 'token', 'content': token})}\n\n"
-                        # Ollama streaming stats: may include done + eval_count
-                        if data.get("done"):
-                            prompt_tokens = data.get("prompt_eval_count", 0)
-                            completion_tokens = data.get("eval_count", 0)
+            }
+            async with client.stream("POST", "/api/chat", json=payload) as response:
+                response.raise_for_status()
+                async for line in response.aiter_lines():
+                    if not line.strip():
+                        continue
+                    try:
+                        data = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if "message" in data and "content" in data["message"]:
+                        token = data["message"]["content"]
+                        answer_parts.append(token)
+                        yield f"data: {json.dumps({'type': 'token', 'content': token})}\n\n"
+                    if data.get("done"):
+                        prompt_tokens = data.get("prompt_eval_count", 0)
+                        completion_tokens = data.get("eval_count", 0)
         else:
             # Fallback: emit whole answer at once
             answer = _fallback_answer(query, chunks)

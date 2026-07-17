@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from typing import Optional
-from sqlalchemy import select, or_, func
+from sqlalchemy import select, or_, func, String
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql import text
 
@@ -33,7 +33,7 @@ async def search_documents(
             Document.title.ilike(f"%{query}%"),
             Document.author.ilike(f"%{query}%"),
             Document.subject.ilike(f"%{query}%"),
-            Document.tags.cast(func.text()).ilike(f"%{query}%"),
+            Document.tags.cast(String).ilike(f"%{query}%"),
         )
     ]
     if owner_id:

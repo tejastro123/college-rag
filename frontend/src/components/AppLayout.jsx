@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback } from 'react'
 import { Outlet, NavLink, useNavigate } from 'react-router-dom'
-import { MessageSquare, FileText, BookOpen, Zap, LogOut, ChevronDown, ChevronUp, Menu } from 'lucide-react'
+import { MessageSquare, FileText, BookOpen, Zap, LogOut, ChevronDown, ChevronUp, Menu, Search } from 'lucide-react'
 import { useAuthStore, useCourseStore } from '../store'
 import { coursesApi } from '../api'
 import { useIsMobile } from '../hooks/useMediaQuery'
@@ -12,6 +12,7 @@ const navItems = [
   { to: '/documents', icon: FileText,       label: 'Documents' },
   { to: '/courses',   icon: BookOpen,       label: 'Courses' },
   { to: '/study',     icon: Zap,            label: 'Study' },
+  { to: '/web-search', icon: Search,       label: 'Web Search' },
 ]
 
 function NavItem({ to, icon: Icon, label, onClick }) {

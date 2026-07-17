@@ -1,7 +1,7 @@
-"""Vector store abstraction using ChromaDB."""
+"""Vector store abstraction using ChromaDB with async thread offloading."""
 from __future__ import annotations
 
-import os
+import asyncio
 from pathlib import Path
 from typing import List, Optional
 
@@ -26,8 +26,8 @@ class VectorStore:
     ) -> None:
         if not texts:
             return
-        # ChromaDB handles embedding internally via the embedding function
-        self._collection.upsert(
+        await asyncio.to_thread(
+            self._collection.upsert,
             documents=texts,
             ids=ids,
             metadatas=metadatas,
@@ -44,13 +44,15 @@ class VectorStore:
         if where:
             kwargs["where"] = where
         try:
-            results = self._collection.query(**kwargs)
+            results = await asyncio.to_thread(
+                self._collection.query, **kwargs
+            )
         except Exception as e:
             logger.error("Vector search failed", error=str(e))
             return []
 
         hits = []
-        if results and results["ids"]:
+        if results and results.get("ids"):
             for i, (rid, doc, dist, meta) in enumerate(zip(
                 results["ids"][0],
                 results["documents"][0],
@@ -60,7 +62,7 @@ class VectorStore:
                 hits.append({
                     "id": rid,
                     "content": doc,
-                    "score": 1 - dist,  # cosine distance → similarity
+                    "score": 1 - dist,
                     "rank": i + 1,
                     "metadata": meta or {},
                 })
@@ -68,16 +70,34 @@ class VectorStore:
 
     async def delete_document(self, document_id: str) -> None:
         try:
-            results = self._collection.get(where={"document_id": document_id})
-            if results and results["ids"]:
-                self._collection.delete(ids=results["ids"])
+            results = await asyncio.to_thread(
+                self._collection.get, where={"document_id": document_id}
+            )
+            if results and results.get("ids"):
+                await asyncio.to_thread(
+                    self._collection.delete, ids=results["ids"]
+                )
                 logger.info("Vectors deleted", document_id=document_id, count=len(results["ids"]))
         except Exception as e:
             logger.error("Vector delete failed", error=str(e))
 
-    def get_collection_stats(self) -> dict:
+    async def get_all_ids(self) -> list[str]:
         try:
-            count = self._collection.count()
+            results = await asyncio.to_thread(self._collection.get)
+            return results.get("ids", [])
+        except Exception as e:
+            logger.error("Failed to get all IDs", error=str(e))
+            return []
+
+    async def clear_all(self) -> None:
+        ids = await self.get_all_ids()
+        if ids:
+            await asyncio.to_thread(self._collection.delete, ids=ids)
+            logger.info("Vector store cleared", count=len(ids))
+
+    async def get_collection_stats(self) -> dict:
+        try:
+            count = await asyncio.to_thread(self._collection.count)
             return {"total_vectors": count}
         except Exception:
             return {"total_vectors": 0}

@@ -1,6 +1,7 @@
 """Document ingestion pipeline orchestrator."""
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import os
 import shutil
@@ -63,7 +64,7 @@ async def ingest_document(
         logger.info("Starting ingestion", doc_id=document_id, filename=doc.original_filename)
 
         # ── 1. Parse ───────────────────────────────────────────
-        parsed = parse_document(path)
+        parsed = await asyncio.to_thread(parse_document, path)
         total_pages = len(parsed.pages)
 
         # ── 2. Chunk ───────────────────────────────────────────
@@ -77,7 +78,7 @@ async def ingest_document(
             "doc_type": doc.doc_type,
             "author": doc.author or parsed.metadata.get("author", ""),
         }
-        chunks = chunk_document(parsed.pages, doc_metadata=doc_metadata)
+        chunks = await asyncio.to_thread(chunk_document, parsed.pages, doc_metadata=doc_metadata)
 
         if not chunks:
             doc.status = "failed"
@@ -206,11 +207,7 @@ async def reindex_all_documents(db: Optional[AsyncSession] = None) -> dict:
         try:
             from app.embeddings.vector_store import get_vector_store
             vs = await get_vector_store()
-            # Delete all vectors by getting all IDs first
-            all_ids = vs._collection.get()["ids"]
-            if all_ids:
-                vs._collection.delete(ids=all_ids)
-            logger.info("Vector store cleared", deleted=len(all_ids))
+            await vs.clear_all()
         except Exception as e:
             logger.warning("Vector store clear failed", error=str(e))
 

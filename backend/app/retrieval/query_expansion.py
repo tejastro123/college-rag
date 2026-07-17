@@ -4,31 +4,29 @@ from __future__ import annotations
 import re
 from typing import Optional
 
-import httpx
-
 from app.core.config import settings
 from app.core.logging import get_logger
+from app.services.http_client import get_ollama_client
 
 logger = get_logger(__name__)
 
 
 async def _call_llm(prompt: str, system: str = "") -> Optional[str]:
     try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            url = f"{settings.OLLAMA_BASE_URL.rstrip('/')}/api/chat"
-            messages = []
-            if system:
-                messages.append({"role": "system", "content": system})
-            messages.append({"role": "user", "content": prompt})
-            payload = {
-                "model": settings.OLLAMA_MODEL,
-                "messages": messages,
-                "stream": False,
-                "options": {"temperature": 0.7, "num_predict": 500},
-            }
-            response = await client.post(url, json=payload)
-            response.raise_for_status()
-            return response.json().get("message", {}).get("content", "")
+        client = get_ollama_client()
+        messages = []
+        if system:
+            messages.append({"role": "system", "content": system})
+        messages.append({"role": "user", "content": prompt})
+        payload = {
+            "model": settings.OLLAMA_MODEL,
+            "messages": messages,
+            "stream": False,
+            "options": {"temperature": 0.7, "num_predict": 500},
+        }
+        response = await client.post("/api/chat", json=payload)
+        response.raise_for_status()
+        return response.json().get("message", {}).get("content", "")
     except Exception as e:
         logger.warning("LLM call failed for query expansion", error=str(e))
         return None

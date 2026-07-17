@@ -117,6 +117,12 @@ class Settings(BaseSettings):
                 return [o.strip() for o in v.split(",")]
         return v
 
+    # ── Admin Seed ─────────────────────────────────────────
+    ADMIN_EMAIL: str = "admin@collegerag.com"
+    ADMIN_PASSWORD: str = "admin123"
+    ADMIN_USERNAME: str = "admin"
+    ADMIN_FULL_NAME: str = "System Administrator"
+
     # ── Logging ────────────────────────────────────────────
     LOG_LEVEL: str = "INFO"
 

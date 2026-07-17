@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
 import { authApi } from '../api'
 import { useAuthStore } from '../store'
@@ -9,8 +9,14 @@ export default function LoginPage() {
   const [password, setPassword] = useState('')
   const [error, setError] = useState('')
   const [loading, setLoading] = useState(false)
-  const { setAuth } = useAuthStore()
+  const { token, user, setAuth } = useAuthStore()
   const navigate = useNavigate()
+
+  useEffect(() => {
+    if (token) {
+      navigate(user?.role === 'admin' ? '/admin' : '/chat', { replace: true })
+    }
+  }, [token, user, navigate])
 
   const submit = async (e) => {
     e.preventDefault()
@@ -19,7 +25,7 @@ export default function LoginPage() {
     try {
       const r = await authApi.login({ email, password })
       setAuth(r.data.access_token, r.data.user)
-      navigate('/chat')
+      navigate(r.data.user?.role === 'admin' ? '/admin' : '/chat')
     } catch (err) {
       const detail = err.response?.data?.detail
       setError(Array.isArray(detail) ? detail.map(e => e.msg).join(', ') : detail || 'Login failed')
