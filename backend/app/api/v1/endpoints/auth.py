@@ -108,3 +108,52 @@ async def get_me(current_user: User = Depends(get_current_user)):
         semester=current_user.semester,
         is_active=current_user.is_active,
     )
+
+
+class ProfileUpdateRequest(BaseModel):
+    full_name: str = Field(min_length=2, max_length=100)
+    username: str = Field(min_length=3, max_length=50)
+    department: str | None = None
+    semester: str | None = None
+
+
+class PasswordChangeRequest(BaseModel):
+    old_password: str
+    new_password: str = Field(min_length=8)
+
+
+@router.put("/profile", response_model=UserResponse)
+async def update_profile(
+    data: ProfileUpdateRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    if data.username != current_user.username:
+        existing = await db.execute(
+            select(User).where(User.username == data.username)
+        )
+        if existing.scalar_one_or_none():
+            raise HTTPException(status_code=400, detail="Username already taken")
+
+    current_user.full_name = data.full_name
+    current_user.username = data.username
+    current_user.department = data.department
+    current_user.semester = data.semester
+
+    await db.commit()
+    await db.refresh(current_user)
+    return current_user
+
+
+@router.put("/password")
+async def update_password(
+    data: PasswordChangeRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    if not verify_password(data.old_password, current_user.hashed_password):
+        raise HTTPException(status_code=400, detail="Incorrect old password")
+
+    current_user.hashed_password = hash_password(data.new_password)
+    await db.commit()
+    return {"status": "success", "message": "Password updated successfully"}

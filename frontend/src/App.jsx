@@ -15,6 +15,7 @@ const AdminDashboard = lazy(() => import('./pages/AdminDashboard'))
 const OrganizationSettings = lazy(() => import('./pages/OrganizationSettings'))
 const BillingPage = lazy(() => import('./pages/BillingPage'))
 const WebSearchPage = lazy(() => import('./pages/WebSearchPage'))
+const SettingsPage = lazy(() => import('./pages/SettingsPage'))
 
 function PageFallback() {
   return (
@@ -43,7 +44,43 @@ function AdminRoute({ children }) {
   return children
 }
 
+import { useEffect } from 'react'
+
 export default function App() {
+  useEffect(() => {
+    const savedTheme = localStorage.getItem('rag-theme') || 'dark'
+    const savedAccent = localStorage.getItem('rag-accent-color') || 'stone'
+    document.documentElement.setAttribute('data-theme', savedTheme)
+
+    const accentPresets = {
+      stone: { accent: '#a3a3a3', light: '#d4d4d4', dark: '#737373' },
+      violet: { accent: '#8b5cf6', light: '#a78bfa', dark: '#6d28d9' },
+      cyan: { accent: '#06b6d4', light: '#22d3ee', dark: '#0e7490' },
+      emerald: { accent: '#10b981', light: '#34d399', dark: '#047857' },
+      amber: { accent: '#f59e0b', light: '#fbbf24', dark: '#b45309' },
+      rose: { accent: '#f43f5e', light: '#fb7185', dark: '#be123c' }
+    }
+    const lightPresets = {
+      stone: { accent: '#525252', light: '#262626', dark: '#a3a3a3' },
+      violet: { accent: '#7c3aed', light: '#6d28d9', dark: '#ddd6fe' },
+      cyan: { accent: '#0891b2', light: '#0e7490', dark: '#cffafe' },
+      emerald: { accent: '#059669', light: '#047857', dark: '#d1fae5' },
+      amber: { accent: '#d97706', light: '#b45309', dark: '#fef3c7' },
+      rose: { accent: '#e11d48', light: '#be123c', dark: '#ffe4e6' }
+    }
+    const preset = savedTheme === 'light' ? lightPresets[savedAccent] : accentPresets[savedAccent]
+    if (preset) {
+      document.documentElement.style.setProperty('--accent', preset.accent)
+      document.documentElement.style.setProperty('--accent-light', preset.light)
+      document.documentElement.style.setProperty('--accent-dark', preset.dark)
+      if (savedTheme === 'light') {
+        document.documentElement.style.setProperty('--grad-brand', `linear-gradient(135deg, ${preset.accent} 0%, ${preset.light} 50%, ${preset.dark} 100%)`)
+      } else {
+        document.documentElement.style.setProperty('--grad-brand', `linear-gradient(135deg, ${preset.dark} 0%, ${preset.accent} 50%, ${preset.light} 100%)`)
+      }
+    }
+  }, [])
+
   return (
     <BrowserRouter future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
       <ToastProvider>
@@ -61,6 +98,7 @@ export default function App() {
               <Route path="org/:orgId" element={<OrganizationSettings />} />
               <Route path="billing" element={<BillingPage />} />
               <Route path="web-search" element={<WebSearchPage />} />
+              <Route path="settings" element={<SettingsPage />} />
             </Route>
           </Routes>
         </Suspense>

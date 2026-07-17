@@ -3,6 +3,7 @@ import { useNavigate, NavLink } from 'react-router-dom'
 import {
   Send, Plus, Trash2, ThumbsUp, ThumbsDown, Settings2,
   MessageSquare, FileText, BookOpen, Zap, LogOut, Menu, X,
+  ChevronLeft, ChevronRight, Settings, User, Sparkles, Palette, HelpCircle
 } from 'lucide-react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
@@ -11,6 +12,7 @@ import { chatApi } from '../api'
 import { useChatStore, useCourseStore, useAuthStore } from '../store'
 import { useIsMobile } from '../hooks/useMediaQuery'
 import { MessageSkeleton } from './shared/Skeleton'
+import ThemeToggle from './shared/ThemeToggle'
 
 const MODES = [
   { id: 'normal',   label: 'Normal',   desc: 'Balanced answers' },
@@ -143,48 +145,46 @@ function groupConversations(conversations) {
   return groups
 }
 
-function ChatSidebar({ conversations, activeConversation, onSelect, onNew, onDelete, user, onLogout }) {
+function ChatSidebar({
+  conversations, activeConversation, onSelect, onNew, onDelete, user, onLogout,
+  isCollapsed, toggleCollapse, popoverOpen, setPopoverOpen
+}) {
   const groups = groupConversations(conversations)
-
-  const navItemStyle = (isActive) => ({
-    display: 'flex', alignItems: 'center', gap: '.65rem',
-    padding: '.55rem .75rem', borderRadius: 'var(--radius)',
-    background: isActive ? 'rgba(255,255,255,.08)' : 'transparent',
-    border: isActive ? '1px solid rgba(255,255,255,.2)' : '1px solid transparent',
-    borderLeft: isActive ? '2px solid var(--accent)' : '2px solid transparent',
-    color: isActive ? 'var(--accent-light)' : 'var(--text-secondary)',
-    transition: 'all .15s', cursor: 'pointer',
-  })
+  const navigate = useNavigate()
 
   return (
     <div className="chat-sidebar-inner">
-      <div style={{ padding: '1rem', display: 'flex', alignItems: 'center', gap: '.75rem', justifyContent: 'center' }}>
+      <div style={{ padding: '1rem', display: 'flex', alignItems: 'center', gap: '.75rem', justifyContent: 'center', flexShrink: 0 }}>
         <div className="glow-pulse" style={{
           width: 36, height: 36, borderRadius: 12,
           background: 'var(--grad-brand)',
           display: 'flex', alignItems: 'center', justifyContent: 'center',
           fontSize: '1.1rem', boxShadow: 'var(--shadow-glow)', flexShrink: 0,
         }}>🎓</div>
-        <NavLink to="/chat" style={{ textDecoration: 'none', color: 'inherit' }}>
-          <span className="brand-text" style={{ fontFamily: 'var(--font-display)', fontWeight: 700, fontSize: '1rem', letterSpacing: '-.02em' }}>CollegeRAG</span>
-        </NavLink>
+        {!isCollapsed && (
+          <NavLink to="/chat" style={{ textDecoration: 'none', color: 'inherit' }}>
+            <span className="brand-text" style={{ fontFamily: 'var(--font-display)', fontWeight: 700, fontSize: '1rem', letterSpacing: '-.02em' }}>CollegeRAG</span>
+          </NavLink>
+        )}
       </div>
 
       <nav style={{ padding: '.5rem', display: 'flex', flexDirection: 'column', gap: '.1rem', borderBottom: '1px solid var(--glass-border)' }}>
         <NavLink to="/chat" style={{ textDecoration: 'none' }}>
           {({ isActive }) => (
-            <div style={navItemStyle(isActive)}>
+            <div className={`tooltip-wrap nav-item-inner ${isActive ? 'active' : ''}`} style={{ justifyContent: isCollapsed ? 'center' : 'flex-start', padding: isCollapsed ? '.55rem 0' : '.55rem .75rem' }}>
               <MessageSquare size={16} style={{ flexShrink: 0 }} />
-              <span className="nav-label" style={{ fontSize: '.875rem', fontWeight: isActive ? 600 : 400 }}>Chat</span>
+              {!isCollapsed && <span className="nav-label" style={{ fontSize: '.875rem', fontWeight: isActive ? 600 : 400 }}>Chat</span>}
+              {isCollapsed && <span className="sidebar-tooltip">Chat</span>}
             </div>
           )}
         </NavLink>
         {appNavItems.map(item => (
           <NavLink key={item.to} to={item.to} style={{ textDecoration: 'none' }}>
             {({ isActive }) => (
-              <div style={navItemStyle(isActive)}>
+              <div className={`tooltip-wrap nav-item-inner ${isActive ? 'active' : ''}`} style={{ justifyContent: isCollapsed ? 'center' : 'flex-start', padding: isCollapsed ? '.55rem 0' : '.55rem .75rem' }}>
                 <item.icon size={16} style={{ flexShrink: 0 }} />
-                <span className="nav-label" style={{ fontSize: '.875rem', fontWeight: isActive ? 600 : 400 }}>{item.label}</span>
+                {!isCollapsed && <span className="nav-label" style={{ fontSize: '.875rem', fontWeight: isActive ? 600 : 400 }}>{item.label}</span>}
+                {isCollapsed && <span className="sidebar-tooltip">{item.label}</span>}
               </div>
             )}
           </NavLink>
@@ -192,65 +192,155 @@ function ChatSidebar({ conversations, activeConversation, onSelect, onNew, onDel
       </nav>
 
       <div style={{ padding: '.65rem .75rem' }}>
-        <button className="btn btn-primary new-chat-btn w-full" style={{ fontSize: '.8125rem' }} onClick={onNew}>
-          <Plus size={14} />
-          <span className="new-chat-text">New Chat</span>
-        </button>
+        <div className="tooltip-wrap" style={{ width: '100%' }}>
+          <button className="btn btn-primary new-chat-btn w-full" style={{ fontSize: '.8125rem', justifyContent: 'center', padding: isCollapsed ? '.5rem 0' : undefined }} onClick={onNew}>
+            <Plus size={14} style={{ flexShrink: 0 }} />
+            {!isCollapsed && <span className="new-chat-text">New Chat</span>}
+          </button>
+          {isCollapsed && <span className="sidebar-tooltip">New Chat</span>}
+        </div>
       </div>
 
       <div className="conv-section" style={{ flex: 1, overflowY: 'auto', padding: '0 .5rem .5rem' }}>
         {groups.map(({ label, items }) => items.length > 0 && (
           <div key={label}>
-            <div style={{ fontSize: '.625rem', fontWeight: 600, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '.08em', padding: '.5rem .75rem .25rem' }}>
-              {label}
-            </div>
+            {!isCollapsed && (
+              <div style={{ fontSize: '.625rem', fontWeight: 600, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '.08em', padding: '.5rem .75rem .25rem' }}>
+                {label}
+              </div>
+            )}
             {items.map(conv => (
-              <div key={conv.id} onClick={() => onSelect(conv)} style={{
-                padding: '.45rem .75rem', borderRadius: 'var(--radius-sm)', cursor: 'pointer', marginBottom: '.1rem',
-                background: activeConversation?.id === conv.id ? 'rgba(255,255,255,.08)' : 'transparent',
-                borderLeft: activeConversation?.id === conv.id ? '2px solid var(--accent)' : '2px solid transparent',
-                display: 'flex', alignItems: 'center', gap: '.5rem', transition: 'all .15s',
-              }}>
-                <span style={{ flex: 1, fontSize: '.8125rem', color: activeConversation?.id === conv.id ? 'var(--accent-light)' : 'var(--text-secondary)' }} className="truncate">
-                  {conv.title}
-                </span>
-                <button className="btn btn-icon" style={{ opacity: 0.4, padding: '.15rem', flexShrink: 0 }} onClick={(e) => { e.stopPropagation(); onDelete(conv.id) }}>
-                  <Trash2 size={11} />
-                </button>
+              <div key={conv.id} className="tooltip-wrap" style={{ width: '100%' }}>
+                <div onClick={() => onSelect(conv)} style={{
+                  padding: isCollapsed ? '.5rem 0' : '.45rem .75rem', borderRadius: 'var(--radius-sm)', cursor: 'pointer', marginBottom: '.1rem',
+                  background: activeConversation?.id === conv.id ? 'rgba(255,255,255,.08)' : 'transparent',
+                  borderLeft: activeConversation?.id === conv.id ? '2px solid var(--accent)' : '2px solid transparent',
+                  display: 'flex', alignItems: 'center', justifyContent: isCollapsed ? 'center' : 'flex-start', gap: '.5rem', transition: 'all .15s',
+                }}>
+                  {isCollapsed ? (
+                    <MessageSquare size={14} style={{ color: activeConversation?.id === conv.id ? 'var(--accent-light)' : 'var(--text-muted)' }} />
+                  ) : (
+                    <>
+                      <span style={{ flex: 1, fontSize: '.8125rem', color: activeConversation?.id === conv.id ? 'var(--accent-light)' : 'var(--text-secondary)' }} className="truncate">
+                        {conv.title}
+                      </span>
+                      <button className="btn btn-icon" style={{ opacity: 0.4, padding: '.15rem', flexShrink: 0 }} onClick={(e) => { e.stopPropagation(); onDelete(conv.id) }}>
+                        <Trash2 size={11} />
+                      </button>
+                    </>
+                  )}
+                </div>
+                {isCollapsed && <span className="sidebar-tooltip">{conv.title}</span>}
               </div>
             ))}
           </div>
         ))}
-        {conversations.length === 0 && (
+        {conversations.length === 0 && !isCollapsed && (
           <div style={{ color: 'var(--text-muted)', fontSize: '.8125rem', textAlign: 'center', padding: '2rem .5rem' }}>
             No conversations yet.<br />Ask a question to start!
           </div>
         )}
       </div>
 
-      <div style={{ borderTop: '1px solid var(--glass-border)', padding: '.75rem', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: '.5rem' }}>
-          <div style={{
-            width: 30, height: 30, borderRadius: '50%',
-            background: 'var(--grad-brand)', padding: 2,
-            display: 'flex', alignItems: 'center', justifyContent: 'center',
-          }}>
-            <div style={{
-              width: '100%', height: '100%', borderRadius: '50%',
-              background: 'var(--bg-surface)',
-              display: 'flex', alignItems: 'center', justifyContent: 'center',
-              fontSize: '.65rem', fontWeight: 700, color: 'var(--accent-light)',
-            }}>{user?.full_name?.[0] || 'U'}</div>
-          </div>
-          <span className="user-name truncate" style={{ fontSize: '.8125rem', color: 'var(--text-secondary)' }}>{user?.full_name || 'User'}</span>
+      <div style={{ padding: '.5rem', display: 'flex', justifyContent: isCollapsed ? 'center' : 'flex-start' }}>
+        <ThemeToggle />
+      </div>
+
+      <div className="hide-mobile" style={{ padding: '0 .5rem', marginBottom: '.25rem' }}>
+        <div className="tooltip-wrap" style={{ width: '100%' }}>
+          <button
+            onClick={toggleCollapse}
+            className="nav-item-inner"
+            style={{
+              background: 'transparent', border: 'none', padding: '.5rem',
+              justifyContent: isCollapsed ? 'center' : 'flex-start',
+              color: 'var(--text-muted)'
+            }}
+          >
+            {isCollapsed ? <ChevronRight size={18} /> : <ChevronLeft size={18} />}
+            {!isCollapsed && <span className="nav-label" style={{ fontSize: '.8125rem' }}>Collapse sidebar</span>}
+          </button>
+          <span className="sidebar-tooltip">{isCollapsed ? "Expand sidebar" : "Collapse sidebar"}</span>
         </div>
-        <button className="btn btn-ghost btn-icon" onClick={onLogout} style={{ padding: '.4rem', background: 'transparent' }}>
-          <LogOut size={14} />
-        </button>
+      </div>
+
+      <div style={{ borderTop: '1px solid rgba(255,255,255,0.06)', padding: '.5rem', flexShrink: 0, position: 'relative' }}>
+        {/* User Popover Menu */}
+        {popoverOpen && (
+          <div className="user-popover" style={{ bottom: '55px' }}>
+            <div className="user-popover-header" onClick={() => { setPopoverOpen(false); navigate('/settings?tab=profile'); }}>
+              <div className="user-popover-avatar">
+                {user?.full_name?.[0]?.toUpperCase() || 'U'}
+              </div>
+              <div className="user-popover-info">
+                <span className="user-popover-username truncate">{user?.username || 'user'}</span>
+                <span className="user-popover-subtext truncate">{user?.role || 'Go'}</span>
+              </div>
+              <ChevronRight size={14} className="user-popover-chevron" style={{ color: 'var(--text-muted)' }} />
+            </div>
+            <div className="user-popover-divider" />
+            <button className="user-popover-item" onClick={() => { setPopoverOpen(false); navigate('/billing'); }}>
+              <Sparkles size={14} />
+              <span>Upgrade plan</span>
+            </button>
+            <button className="user-popover-item" onClick={() => { setPopoverOpen(false); navigate('/settings?tab=personalization'); }}>
+              <Palette size={14} />
+              <span>Personalization</span>
+            </button>
+            <button className="user-popover-item" onClick={() => { setPopoverOpen(false); navigate('/settings?tab=profile'); }}>
+              <User size={14} />
+              <span>Profile</span>
+            </button>
+            <button className="user-popover-item" onClick={() => { setPopoverOpen(false); navigate('/settings?tab=general'); }}>
+              <Settings size={14} />
+              <span>Settings</span>
+            </button>
+            <div className="user-popover-divider" />
+            <button className="user-popover-item" onClick={() => { setPopoverOpen(false); navigate('/settings?tab=help'); }}>
+              <HelpCircle size={14} />
+              <span>Help</span>
+            </button>
+            <button className="user-popover-item" onClick={() => { setPopoverOpen(false); onLogout(); }}>
+              <LogOut size={14} />
+              <span>Log out</span>
+            </button>
+          </div>
+        )}
+
+        {/* User Row Trigger */}
+        <div className="tooltip-wrap" style={{ width: '100%' }}>
+          <div className="sidebar-user-row" onClick={() => setPopoverOpen(!popoverOpen)}>
+            <div style={{
+              width: 34, height: 34, borderRadius: '50%',
+              background: '#ec4899', // Pink avatar
+              display: 'flex', alignItems: 'center', justifyContent: 'center',
+              fontSize: '.8rem', fontWeight: 700, color: 'white', flexShrink: 0
+            }}>
+              {user?.full_name?.[0]?.toUpperCase() || 'U'}
+            </div>
+            {!isCollapsed && (
+              <>
+                <div className="sidebar-user-info" style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column' }}>
+                  <span className="truncate" style={{ fontSize: '.8125rem', fontWeight: 600, color: 'var(--text-primary)' }}>
+                    {user?.username || 'user'}
+                  </span>
+                  <span className="truncate" style={{ fontSize: '.7rem', color: 'var(--text-muted)' }}>
+                    Go
+                  </span>
+                </div>
+                <ChevronRight size={14} className="sidebar-user-chevron" style={{ color: 'var(--text-muted)', transform: popoverOpen ? 'rotate(-90deg)' : 'none', transition: 'transform 0.15s' }} />
+              </>
+            )}
+          </div>
+          <span className="sidebar-tooltip">
+            {user?.full_name || 'User'}
+          </span>
+        </div>
       </div>
     </div>
   )
 }
+
 
 function ChatHeader({ activeConversation, activeCourse, mode, onSetMode, showFormats, onToggleFormats, onToggleSidebar, sidebarOpen }) {
   return (
@@ -376,10 +466,23 @@ export default function ChatLayout() {
   const [input, setInput] = useState('')
   const [showFormats, setShowFormats] = useState(false)
   const [sidebarOpen, setSidebarOpen] = useState(false)
+  const [isCollapsed, setIsCollapsed] = useState(() => localStorage.getItem('sidebar-collapsed') === 'true')
+  const [popoverOpen, setPopoverOpen] = useState(false)
   const messagesEndRef = useRef(null)
   const inputRef = useRef(null)
   const isMobile = useIsMobile()
   const navigate = useNavigate()
+
+  useEffect(() => {
+    if (!popoverOpen) return
+    const handleOutsideClick = (e) => {
+      if (!e.target.closest('.user-popover') && !e.target.closest('.sidebar-user-row')) {
+        setPopoverOpen(false)
+      }
+    }
+    document.addEventListener('click', handleOutsideClick)
+    return () => document.removeEventListener('click', handleOutsideClick)
+  }, [popoverOpen])
 
   useEffect(() => { loadConversations() }, [])
   useEffect(() => { messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' }) }, [messages])
@@ -462,7 +565,7 @@ export default function ChatLayout() {
 
       <div className={`chat-sidebar-overlay ${sidebarOpen ? 'open' : ''}`} onClick={() => setSidebarOpen(false)} />
 
-      <aside className={`chat-sidebar ${sidebarOpen ? 'open' : ''}`}>
+      <aside className={`chat-sidebar ${sidebarOpen ? 'open' : ''} ${isCollapsed ? 'collapsed' : ''}`}>
         <div className="hide-desktop" style={{ display: 'flex', justifyContent: 'flex-end', padding: '.5rem' }}>
           <button className="btn btn-ghost btn-icon" onClick={() => setSidebarOpen(false)}>
             <X size={16} />
@@ -476,6 +579,16 @@ export default function ChatLayout() {
           onDelete={deleteConversation}
           user={user}
           onLogout={handleLogout}
+          isCollapsed={isCollapsed}
+          toggleCollapse={() => {
+            setIsCollapsed(prev => {
+              const next = !prev
+              localStorage.setItem('sidebar-collapsed', String(next))
+              return next
+            })
+          }}
+          popoverOpen={popoverOpen}
+          setPopoverOpen={setPopoverOpen}
         />
       </aside>
 
