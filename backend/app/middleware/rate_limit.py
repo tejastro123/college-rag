@@ -25,10 +25,4 @@ def init_rate_limiter():
 
 class RateLimitMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next: RequestResponseEndpoint) -> Response:
-        if _limiter is not None:
-            try:
-                _limiter.check_request_limit(request)
-            except Exception:
-                from fastapi import HTTPException
-                raise HTTPException(status_code=429, detail="Too many requests — please slow down")
         return await call_next(request)
