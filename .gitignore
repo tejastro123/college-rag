@@ -1,0 +1,39 @@
+# ── Python ───────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+dist/
+build/
+*.egg
+.venv/
+venv/
+env/
+
+# ── Environment ──────────────────────────────
+.env
+backend/.env
+
+# ── Databases & Data ─────────────────────────
+*.db
+*.sqlite
+backend/data/
+
+# ── Node ─────────────────────────────────────
+node_modules/
+frontend/dist/
+
+# ── IDE / OS ─────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ── Docker ───────────────────────────────────
+.docker/
+
+# ── Logs ─────────────────────────────────────
+*.log
