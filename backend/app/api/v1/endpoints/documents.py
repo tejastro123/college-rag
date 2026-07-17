@@ -234,3 +234,14 @@ async def reprocess_document(
     await db.commit()
     background_tasks.add_task(ingest_document, doc.id, doc.file_path)
     return {"message": "Reprocessing started", "document_id": doc_id}
+
+
+@router.post("/reindex-all", status_code=202)
+async def reindex_all(
+    background_tasks: BackgroundTasks,
+    current_user: User = Depends(get_current_user),
+):
+    """Re-chunk and re-embed all documents for all users (admin)."""
+    from app.ingestion.pipeline import reindex_all_documents
+    background_tasks.add_task(reindex_all_documents)
+    return {"message": "Re-indexing all documents started"}

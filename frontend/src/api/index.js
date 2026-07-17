@@ -39,6 +39,57 @@ export const documentsApi = {
 // Chat
 export const chatApi = {
   send: (data) => api.post('/chat/', data),
+  sendStream: async (data, { onToken, onCitations, onComplete, onError }) => {
+    const token = useAuthStore.getState().token
+    const response = await fetch('/api/v1/chat/stream', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      },
+      body: JSON.stringify(data),
+    })
+    if (!response.ok) {
+      onError?.(`Request failed: ${response.status}`)
+      return
+    }
+    const reader = response.body.getReader()
+    const decoder = new TextDecoder()
+    let buffer = ''
+    let metadata = null
+
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      buffer += decoder.decode(value, { stream: true })
+      const lines = buffer.split('\n')
+      buffer = lines.pop() || ''
+
+      for (const line of lines) {
+        if (!line.startsWith('data: ')) continue
+        try {
+          const payload = JSON.parse(line.slice(6))
+          switch (payload.type) {
+            case 'metadata':
+              metadata = payload
+              break
+            case 'token':
+              onToken?.(payload.content)
+              break
+            case 'citations':
+              onCitations?.(payload.citations)
+              break
+            case 'complete':
+              onComplete?.({ ...payload, ...metadata })
+              break
+            case 'error':
+              onError?.(payload.detail)
+              break
+          }
+        } catch { /* skip malformed SSE */ }
+      }
+    }
+  },
   conversations: (params) => api.get('/chat/conversations', { params }),
   messages: (convId) => api.get(`/chat/conversations/${convId}/messages`),
   deleteConversation: (id) => api.delete(`/chat/conversations/${id}`),

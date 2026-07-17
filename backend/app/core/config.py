@@ -60,11 +60,24 @@ class Settings(BaseSettings):
     ANTHROPIC_API_KEY: Optional[str] = None
     ANTHROPIC_MODEL: str = "claude-3-haiku-20240307"
 
+    # ── Embeddings ─────────────────────────────────────────
+    EMBEDDING_PROVIDER: str = "auto"  # ollama | sentence-transformers | auto
+    SENTENCE_TRANSFORMERS_MODEL: str = "all-mpnet-base-v2"  # 768-dim, matches nomic-embed-text
+    SENTENCE_TRANSFORMERS_CACHE: str = "./data/sentence_transformers"
+
     # ── Cohere (reranking) ─────────────────────────────────
     COHERE_API_KEY: Optional[str] = None
 
+    # ── Reranking ──────────────────────────────────────────
+    RERANK_PROVIDER: str = "auto"  # cohere | local | auto (try cohere → fallback local)
+    RERANK_MODEL: str = "BAAI/bge-reranker-base"
+
     # ── Redis ──────────────────────────────────────────────
     REDIS_URL: str = "redis://localhost:6379/0"
+
+    # ── Semantic Cache ─────────────────────────────────────
+    CACHE_ENABLED: bool = True
+    CACHE_TTL: int = 3600  # 1 hour
 
     # ── OCR ────────────────────────────────────────────────
     TESSERACT_CMD: str = "tesseract"
@@ -74,6 +87,18 @@ class Settings(BaseSettings):
     RERANK_TOP_K: int = 5
     CHUNK_SIZE: int = 800
     CHUNK_OVERLAP: int = 100
+    CHUNKING_STRATEGY: str = "hierarchical"  # hierarchical | recursive
+
+    # ── BM25 Index ─────────────────────────────────────────
+    BM25_INDEX_DIR: str = "./data/bm25"
+    BM25_SEARCH_K: int = 40
+
+    # ── Query Expansion ────────────────────────────────────
+    QUERY_EXPANSION_ENABLED: bool = True
+    QUERY_EXPANSION_VARIANTS: int = 3
+
+    # ── HyDE ───────────────────────────────────────────────
+    HYDE_ENABLED: bool = True
 
     # ── Rate Limiting ──────────────────────────────────────
     RATE_LIMIT_ENABLED: bool = True

@@ -33,7 +33,9 @@ export const useChatStore = create((set) => ({
   outputFormat: 'text',
   setConversations: (conversations) => set({ conversations }),
   setActiveConversation: (conv) => set({ activeConversation: conv }),
-  setMessages: (messages) => set({ messages }),
+  setMessages: (updater) => set((s) => ({
+    messages: typeof updater === 'function' ? updater(s.messages) : updater
+  })),
   addMessage: (msg) => set((s) => ({ messages: [...s.messages, msg] })),
   setLoading: (loading) => set({ loading }),
   setMode: (mode) => set({ mode }),

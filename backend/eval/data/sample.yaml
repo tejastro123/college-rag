@@ -1,0 +1,21 @@
+name: "Sample"
+description: "Sample golden Q&A for verifying the eval harness. Replace with real course data."
+
+questions:
+  - id: "sample_001"
+    question: "What is machine learning and how does it relate to artificial intelligence?"
+    ground_truth: "Machine learning is a subset of artificial intelligence that enables systems to learn and improve from experience without being explicitly programmed."
+    document: "ml_intro.pdf"
+    relevant_indices: [0, 1]
+    course_id: ""
+    metadata:
+      topic: "introduction"
+
+  - id: "sample_002"
+    question: "What are the main types of machine learning?"
+    ground_truth: "The main types are supervised learning, unsupervised learning, and reinforcement learning."
+    document: "ml_types.pdf"
+    relevant_indices: [0]
+    course_id: ""
+    metadata:
+      topic: "types"

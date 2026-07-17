@@ -1,10 +1,12 @@
 """Chat / RAG query endpoints."""
 from __future__ import annotations
 
+import json
 import uuid
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
@@ -14,7 +16,7 @@ from app.db.database import get_db
 from app.models.conversation import Conversation, Message
 from app.models.user import User
 from app.auth.security import get_current_user
-from app.rag.pipeline import run_rag
+from app.rag.pipeline import run_rag, stream_rag
 
 logger = get_logger(__name__)
 router = APIRouter(prefix="/chat", tags=["Chat"])
@@ -136,6 +138,118 @@ async def chat(
         latency_ms=rag_result.latency_ms,
         follow_up_questions=rag_result.follow_up_questions,
     )
+
+
+@router.post("/stream")
+async def chat_stream(
+    request: ChatRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    # ── Load or create conversation ───────────────────────────
+    if request.conversation_id:
+        result = await db.execute(
+            select(Conversation).where(
+                (Conversation.id == request.conversation_id) &
+                (Conversation.user_id == current_user.id)
+            )
+        )
+        conv = result.scalar_one_or_none()
+        if not conv:
+            raise HTTPException(status_code=404, detail="Conversation not found")
+    else:
+        conv = Conversation(
+            user_id=current_user.id,
+            course_id=request.course_id,
+            title=request.message[:60] + ("..." if len(request.message) > 60 else ""),
+            mode=request.mode,
+        )
+        db.add(conv)
+        await db.flush()
+
+    # ── Load history ──────────────────────────────────────────
+    history_result = await db.execute(
+        select(Message)
+        .where(Message.conversation_id == conv.id)
+        .order_by(Message.created_at.desc())
+        .limit(10)
+    )
+    history_msgs = list(reversed(history_result.scalars().all()))
+    conversation_history = [{"role": m.role, "content": m.content} for m in history_msgs]
+
+    # ── Save user message ─────────────────────────────────────
+    user_msg = Message(
+        conversation_id=conv.id,
+        role="user",
+        content=request.message,
+    )
+    db.add(user_msg)
+    await db.flush()
+
+    citations_accumulated = []
+    complete_data = None
+    metadata_sent = {"conversation_id": conv.id, "user_message_id": user_msg.id}
+
+    async def event_stream():
+        nonlocal citations_accumulated, complete_data
+        yield f"data: {json.dumps({'type': 'metadata', **metadata_sent})}\n\n"
+
+        async for event in stream_rag(
+            query=request.message,
+            db=db,
+            mode=request.mode,
+            output_format=request.output_format,
+            course_id=request.course_id,
+            document_ids=request.document_ids,
+            conversation_history=conversation_history,
+            user_id=current_user.id,
+        ):
+            yield event
+            if event.startswith("data: "):
+                try:
+                    payload = json.loads(event[6:])
+                    if payload.get("type") == "citations":
+                        citations_accumulated = payload.get("citations", [])
+                    elif payload.get("type") == "complete":
+                        complete_data = payload
+                except json.JSONDecodeError:
+                    pass
+
+        # Save assistant message to DB after streaming completes
+        if complete_data:
+            try:
+                assistant_msg = Message(
+                    conversation_id=conv.id,
+                    role="assistant",
+                    content=complete_data.get("answer", ""),
+                    citations=citations_accumulated,
+                    confidence=complete_data.get("confidence", 0),
+                    latency_ms=complete_data.get("latency_ms", 0),
+                    tokens_used=str(complete_data.get("tokens_used", 0)),
+                    meta={
+                        "mode": complete_data.get("mode", request.mode),
+                        "chunks_retrieved": complete_data.get("chunks_retrieved", 0),
+                        "follow_up_questions": complete_data.get("follow_up_questions", []),
+                    },
+                )
+                db.add(assistant_msg)
+                await db.commit()
+            except Exception as e:
+                logger.error("Failed to save assistant message", error=str(e))
+
+    response = StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+    # Save assistant message after streaming completes
+    # Use FastAPI's response background task or inline
+    return response
 
 
 @router.get("/conversations", response_model=list[dict])

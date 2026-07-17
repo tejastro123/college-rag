@@ -5,9 +5,10 @@ Answer modes: strict | normal | tutor | exam | revision
 """
 from __future__ import annotations
 
+import json
 import time
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import AsyncGenerator, Optional
 
 from app.core.config import settings
 from app.core.logging import get_logger
@@ -192,3 +193,96 @@ def _fallback_answer(query: str, chunks: list[RetrievedChunk]) -> str:
     for i, chunk in enumerate(chunks[:5], 1):
         parts.append(f"**{i}. From {chunk.filename}** (Page {chunk.page_number or '?'}):\n{chunk.content}")
     return "\n\n".join(parts)
+
+
+async def generate_answer_stream(
+    query: str,
+    chunks: list[RetrievedChunk],
+    mode: str = "normal",
+    conversation_history: list[dict] = None,
+    output_format: str = "text",
+) -> AsyncGenerator[str, None]:
+    """Stream LLM tokens via SSE. Yields JSON lines: token, citations, done."""
+    context, citations = _build_context(chunks)
+    system_prompt = SYSTEM_PROMPTS.get(mode, SYSTEM_PROMPTS["normal"])
+    conversation_history = conversation_history or []
+
+    format_instructions = ""
+    if output_format == "bullets":
+        format_instructions = "\n\nFormat your response as clear bullet points."
+    elif output_format == "table":
+        format_instructions = "\n\nFormat your response as a markdown table where appropriate."
+    elif output_format == "flashcards":
+        format_instructions = "\n\nGenerate 5-10 flashcards. Format: **Q:** question\n**A:** answer"
+    elif output_format == "quiz":
+        format_instructions = "\n\nGenerate 5 multiple choice questions with answers."
+    elif output_format == "summary":
+        format_instructions = "\n\nProvide a concise structured summary with key points."
+
+    user_message = f"""CONTEXT FROM DOCUMENTS:
+{context}
+
+---
+
+STUDENT QUERY: {query}{format_instructions}"""
+
+    messages = []
+    for msg in conversation_history[-6:]:
+        messages.append({"role": msg["role"], "content": msg["content"]})
+    messages.append({"role": "user", "content": user_message})
+
+    # Yield citations early so frontend can show sources immediately
+    yield f"data: {json.dumps({'type': 'citations', 'citations': citations})}\n\n"
+
+    answer_parts = []
+    prompt_tokens = 0
+    completion_tokens = 0
+    provider = settings.LLM_PROVIDER
+
+    try:
+        if provider == "ollama":
+            import httpx
+            async with httpx.AsyncClient(timeout=120.0) as client:
+                url = f"{settings.OLLAMA_BASE_URL.rstrip('/')}/api/chat"
+                payload = {
+                    "model": settings.OLLAMA_MODEL,
+                    "messages": [{"role": "system", "content": system_prompt}] + messages,
+                    "stream": True,
+                    "options": {
+                        "temperature": 0.3,
+                        "num_predict": 2000,
+                    }
+                }
+                async with client.stream("POST", url, json=payload) as response:
+                    response.raise_for_status()
+                    async for line in response.aiter_lines():
+                        if not line.strip():
+                            continue
+                        try:
+                            data = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        if "message" in data and "content" in data["message"]:
+                            token = data["message"]["content"]
+                            answer_parts.append(token)
+                            yield f"data: {json.dumps({'type': 'token', 'content': token})}\n\n"
+                        # Ollama streaming stats: may include done + eval_count
+                        if data.get("done"):
+                            prompt_tokens = data.get("prompt_eval_count", 0)
+                            completion_tokens = data.get("eval_count", 0)
+        else:
+            # Fallback: emit whole answer at once
+            answer = _fallback_answer(query, chunks)
+            answer_parts.append(answer)
+            yield f"data: {json.dumps({'type': 'token', 'content': answer})}\n\n"
+
+    except Exception as e:
+        logger.error("LLM streaming failed", error=str(e), provider=provider)
+        fallback = "\n\n".join(f"**{c.filename}** (Page {c.page_number}):\n{c.content[:300]}..." for c in chunks[:3]) if chunks else "No documents found."
+        yield f"data: {json.dumps({'type': 'token', 'content': fallback})}\n\n"
+
+    full_answer = "".join(answer_parts)
+    tokens_used = prompt_tokens + completion_tokens
+
+    # Signal completion
+    yield f"data: {json.dumps({'type': 'done', 'answer': full_answer, 'tokens_used': tokens_used})}\n\n"

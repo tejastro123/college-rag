@@ -93,6 +93,10 @@ if settings.RATE_LIMIT_ENABLED:
 # ── Routes ─────────────────────────────────────────────────
 app.include_router(api_router, prefix="/api/v1")
 
+# ── Monitoring ────────────────────────────────────────────
+from app.monitoring.endpoints import router as metrics_router
+app.include_router(metrics_router)
+
 
 @app.get("/")
 async def root():

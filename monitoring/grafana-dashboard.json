@@ -1,0 +1,115 @@
+{
+  "__inputs": [{ "name": "DS_PROMETHEUS", "label": "Prometheus", "type": "datasource", "pluginId": "prometheus" }],
+  "__requires": [{ "type": "grafana", "id": "grafana", "name": "Grafana", "version": "10.0.0" }],
+  "title": "CollegeRAG - RAG Pipeline",
+  "uid": "collegerag",
+  "version": 1,
+  "timezone": "browser",
+  "panels": [
+    {
+      "title": "Query Latency (avg)",
+      "type": "stat",
+      "gridPos": { "h": 6, "w": 4, "x": 0, "y": 0 },
+      "targets": [{
+        "expr": "rate(rag_latency_seconds_sum[5m]) / rate(rag_latency_seconds_count[5m])",
+        "legendFormat": "avg latency"
+      }],
+      "fieldConfig": {
+        "defaults": { "unit": "s", "color": { "mode": "thresholds" }, "thresholds": { "steps": [{"color": "green", "value": null}, {"color": "orange", "value": 5}, {"color": "red", "value": 15}] } }
+      }
+    },
+    {
+      "title": "Query Volume (5m)",
+      "type": "stat",
+      "gridPos": { "h": 6, "w": 4, "x": 4, "y": 0 },
+      "targets": [{
+        "expr": "sum(rate(rag_queries_total[5m]))",
+        "legendFormat": "queries/s"
+      }]
+    },
+    {
+      "title": "Avg Confidence",
+      "type": "stat",
+      "gridPos": { "h": 6, "w": 4, "x": 8, "y": 0 },
+      "targets": [{
+        "expr": "rate(rag_confidence_sum[5m]) / rate(rag_confidence_count[5m])",
+        "legendFormat": "avg confidence"
+      }],
+      "fieldConfig": {
+        "defaults": { "unit": "percentunit", "color": { "mode": "thresholds" }, "thresholds": { "steps": [{"color": "red", "value": null}, {"color": "orange", "value": 0.3}, {"color": "green", "value": 0.7}] } }
+      }
+    },
+    {
+      "title": "Latency (p95)",
+      "type": "stat",
+      "gridPos": { "h": 6, "w": 4, "x": 12, "y": 0 },
+      "targets": [{
+        "expr": "histogram_quantile(0.95, rate(rag_latency_seconds_bucket[5m]))",
+        "legendFormat": "p95"
+      }],
+      "fieldConfig": { "defaults": { "unit": "s" } }
+    },
+    {
+      "title": "Retrieval Failures (total)",
+      "type": "stat",
+      "gridPos": { "h": 6, "w": 4, "x": 16, "y": 0 },
+      "targets": [{
+        "expr": "sum(rag_retrieval_failures_total)",
+        "legendFormat": "failures"
+      }],
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "thresholds" }, "thresholds": { "steps": [{"color": "green", "value": null}, {"color": "red", "value": 1}] } }
+      }
+    },
+    {
+      "title": "Tokens Used (total)",
+      "type": "stat",
+      "gridPos": { "h": 6, "w": 4, "x": 20, "y": 0 },
+      "targets": [{
+        "expr": "sum(rag_tokens_total)",
+        "legendFormat": "tokens"
+      }],
+      "fieldConfig": { "defaults": { "unit": "short" } }
+    },
+    {
+      "title": "Query Latency (p50 / p95 / p99)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 6 },
+      "targets": [
+        { "expr": "histogram_quantile(0.50, rate(rag_latency_seconds_bucket[5m]))", "legendFormat": "p50" },
+        { "expr": "histogram_quantile(0.95, rate(rag_latency_seconds_bucket[5m]))", "legendFormat": "p95" },
+        { "expr": "histogram_quantile(0.99, rate(rag_latency_seconds_bucket[5m]))", "legendFormat": "p99" }
+      ]
+    },
+    {
+      "title": "Query Volume by Mode",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 6 },
+      "targets": [
+        { "expr": "sum(rate(rag_queries_total{mode=\"normal\"}[5m]))", "legendFormat": "normal" },
+        { "expr": "sum(rate(rag_queries_total{mode=\"strict\"}[5m]))", "legendFormat": "strict" },
+        { "expr": "sum(rate(rag_queries_total{mode=\"tutor\"}[5m]))", "legendFormat": "tutor" },
+        { "expr": "sum(rate(rag_queries_total{mode=\"exam\"}[5m]))", "legendFormat": "exam" }
+      ]
+    },
+    {
+      "title": "Confidence Distribution",
+      "type": "heatmap",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 14 },
+      "targets": [{
+        "expr": "rate(rag_confidence_bucket[5m])",
+        "format": "heatmap",
+        "legendFormat": "{{le}}"
+      }]
+    },
+    {
+      "title": "Retrieval Failures by Course",
+      "type": "bargauge",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 14 },
+      "targets": [{
+        "expr": "rag_retrieval_failures_total",
+        "legendFormat": "{{course_id}}"
+      }]
+    }
+  ]
+}

@@ -308,33 +308,95 @@ export default function ChatPage() {
     const userMsg = { id: Date.now(), role: 'user', content: text }
     addMessage(userMsg)
 
+    let streamMsgId = Date.now()
+    let accumulatedAnswer = ''
+    let streamCitations = []
+    let streamMetadata = null
+
     try {
-      const r = await chatApi.send({
+      await chatApi.sendStream({
         message: text,
         conversation_id: activeConversation?.id || null,
         course_id: activeCourse?.id || null,
         mode,
         output_format: outputFormat,
         generate_follow_ups: true,
-      })
-      const d = r.data
-      if (!activeConversation) {
-        setActiveConversation({ id: d.conversation_id, title: text.slice(0, 60) })
-        loadConversations()
-      }
-      addMessage({
-        id: d.message_id, role: 'assistant', content: d.answer,
-        citations: d.citations, confidence: d.confidence,
-        latency_ms: d.latency_ms,
-        metadata: { mode: d.mode, follow_up_questions: d.follow_up_questions, chunks_retrieved: d.chunks_retrieved },
+      }, {
+        onToken: (content) => {
+          accumulatedAnswer += content
+          // Update the streaming message with accumulated content
+          setMessages((prev) => {
+            const idx = prev.findIndex((m) => m.id === streamMsgId)
+            if (idx >= 0) {
+              const updated = [...prev]
+              updated[idx] = { ...updated[idx], content: accumulatedAnswer }
+              return updated
+            }
+            // First token — create placeholder
+            const base = { id: streamMsgId, role: 'assistant', content: accumulatedAnswer }
+            return [...prev, base]
+          })
+        },
+        onCitations: (citations) => { streamCitations = citations },
+        onComplete: (data) => {
+          if (!activeConversation && data?.conversation_id) {
+            setActiveConversation({ id: data.conversation_id, title: text.slice(0, 60) })
+            loadConversations()
+          }
+          // Finalize the message with all metadata
+          setMessages((prev) =>
+            prev.map((m) =>
+              m.id === streamMsgId
+                ? {
+                    ...m,
+                    content: data.answer || accumulatedAnswer,
+                    citations: streamCitations,
+                    confidence: data.confidence,
+                    latency_ms: data.latency_ms,
+                    metadata: {
+                      mode: data.mode,
+                      follow_up_questions: data.follow_up_questions,
+                      chunks_retrieved: data.chunks_retrieved,
+                    },
+                  }
+                : m
+            )
+          )
+        },
+        onError: (detail) => {
+          addMessage({ id: Date.now(), role: 'assistant', content: `⚠️ ${detail}` })
+        },
       })
     } catch {
-      addMessage({ id: Date.now(), role: 'assistant', content: '⚠️ Failed to get a response. Please try again.' })
+      // Fallback: non-streaming POST
+      try {
+        const r = await chatApi.send({
+          message: text,
+          conversation_id: activeConversation?.id || null,
+          course_id: activeCourse?.id || null,
+          mode,
+          output_format: outputFormat,
+          generate_follow_ups: true,
+        })
+        const d = r.data
+        if (!activeConversation) {
+          setActiveConversation({ id: d.conversation_id, title: text.slice(0, 60) })
+          loadConversations()
+        }
+        addMessage({
+          id: d.message_id, role: 'assistant', content: d.answer,
+          citations: d.citations, confidence: d.confidence,
+          latency_ms: d.latency_ms,
+          metadata: { mode: d.mode, follow_up_questions: d.follow_up_questions, chunks_retrieved: d.chunks_retrieved },
+        })
+      } catch {
+        addMessage({ id: Date.now(), role: 'assistant', content: '⚠️ Failed to get a response. Please try again.' })
+      }
     } finally {
       setLoading(false)
       inputRef.current?.focus()
     }
-  }, [input, loading, activeConversation, activeCourse, mode, outputFormat, setLoading, addMessage, setActiveConversation, loadConversations])
+  }, [input, loading, activeConversation, activeCourse, mode, outputFormat, setLoading, addMessage, setActiveConversation, loadConversations, setMessages])
 
   const handleFeedback = useCallback(async (msgId, rating) => {
     try { await chatApi.messageFeedback(msgId, rating) } catch {}

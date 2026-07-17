@@ -90,18 +90,14 @@ async def get_vector_store() -> VectorStore:
 
     try:
         import chromadb
-        from chromadb.utils import embedding_functions
 
         persist_dir = Path(settings.CHROMA_PERSIST_DIR)
         persist_dir.mkdir(parents=True, exist_ok=True)
 
         client = chromadb.PersistentClient(path=str(persist_dir))
 
-        # Use Ollama local embedding function
-        ef = embedding_functions.OllamaEmbeddingFunction(
-            url=f"{settings.OLLAMA_BASE_URL.rstrip('/')}/api/embeddings",
-            model_name=settings.OLLAMA_EMBEDDING_MODEL,
-        )
+        from app.embeddings.provider import EmbeddingFunctionProvider
+        ef = EmbeddingFunctionProvider()
 
         collection = client.get_or_create_collection(
             name=settings.CHROMA_COLLECTION_NAME,
