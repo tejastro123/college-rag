@@ -52,3 +52,5 @@ class Bookmark(Base):
     source_info: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
     tags: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    user: Mapped["User"] = relationship("User")  # noqa: F821

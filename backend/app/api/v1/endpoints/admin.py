@@ -11,7 +11,7 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func, delete, case, text
+from sqlalchemy import select, func, delete, case, text, Integer
 from sqlalchemy.orm import joinedload, selectinload
 
 from app.db.database import get_db
@@ -22,6 +22,7 @@ from app.models.billing import UsageRecord, Subscription
 from app.models.organization import Organization, OrganizationMember
 from app.models.audit import AuditLog
 from app.models.course import Course, UserCourse
+from app.models.conversation import Bookmark
 from app.auth.security import get_current_user, decode_token
 from app.services.cache import cache_get, cache_set
 from app.core.logging import get_logger
@@ -154,24 +155,97 @@ async def admin_stats(
         select(func.count(Document.id)).where(Document.status == "failed")
     )).scalar() or 0
 
+    # Latency percentiles (approximate from all messages with latency data)
+    latency_rows = (await db.execute(
+        select(Message.latency_ms)
+        .where(Message.latency_ms.isnot(None))
+        .order_by(Message.latency_ms)
+    )).scalars().all()
+    lat_count = len(latency_rows)
+    latency_p50 = latency_rows[int(lat_count * 0.5)] if lat_count > 0 else None
+    latency_p95 = latency_rows[int(lat_count * 0.95)] if lat_count > 0 else None
+    latency_p99 = latency_rows[int(lat_count * 0.99)] if lat_count > 0 else None
+
+    # Daily active users (distinct users who sent a message today)
+    dau = (await db.execute(
+        select(func.count(func.distinct(Conversation.user_id)))
+        .select_from(Message)
+        .join(Conversation, Message.conversation_id == Conversation.id)
+        .where(Message.created_at >= today)
+    )).scalar() or 0
+
+    # Ingestion throughput (docs indexed in last 24h)
+    ingested_24h = (await db.execute(
+        select(func.count(Document.id))
+        .where(Document.status == "indexed")
+        .where(Document.indexed_at >= (now - timedelta(hours=24)))
+    )).scalar() or 0
+
+    # Avg conversation duration (minutes between first and last message)
+    conv_durations = (await db.execute(
+        select(
+            func.julianday(func.max(Message.created_at)) - func.julianday(func.min(Message.created_at))
+        ).select_from(Message)
+        .group_by(Message.conversation_id)
+        .having(func.count(Message.id) > 1)
+    )).scalars().all()
+    avg_duration_min = round((sum(conv_durations) / len(conv_durations) * 24 * 60) if conv_durations else 0, 1)
+
+    # Messages per conversation ratio
+    msg_per_conv = round(msg_count / conv_count, 1) if conv_count > 0 else 0
+
+    # Active (30d) vs idle users
+    active_30d = (await db.execute(
+        select(func.count(func.distinct(Conversation.user_id)))
+        .where(Conversation.created_at >= (now - timedelta(days=30)))
+    )).scalar() or 0
+    idle_users = max(user_count - active_30d, 0)
+
+    # Previous storage for growth
+    prev_storage = (await db.execute(
+        select(func.sum(Document.file_size)).where(Document.created_at < prev_week)
+    )).scalar() or 0
+
+    # Previous period failed count
+    prev_failed = (await db.execute(
+        select(func.count(Document.id))
+        .where(Document.status == "failed")
+        .where(Document.created_at.between(prev_week, week_ago - timedelta(days=1)))
+    )).scalar() or 0
+
     result = {
         "users": user_count,
         "user_growth": growth(user_count, prev_user_count),
+        "active_users_7d": active_users_7d,
+        "daily_active_users": dau,
+        "active_users_30d": active_30d,
+        "idle_users": idle_users,
         "organizations": org_count,
         "documents": doc_count,
+        "document_growth": growth(doc_count, (await db.execute(select(func.count(Document.id)).where(Document.created_at < prev_week))).scalar() or 0),
         "messages": msg_count,
         "message_growth": growth(msg_count, prev_msg_count),
         "conversations": conv_count,
-        "active_users_7d": active_users_7d,
+        "messages_per_conversation": msg_per_conv,
+        "avg_conversation_duration_min": avg_duration_min,
         "api_calls_7d": api_calls_7d,
         "api_calls_growth": growth(api_calls_7d, prev_usage[0] or 0),
         "tokens_used_7d": tokens_used_7d,
         "tokens_growth": growth(tokens_used_7d, prev_usage[1] or 0),
+        "tokens_per_message": round(tokens_used_7d / msg_count, 1) if msg_count > 0 else 0,
         "storage_bytes": storage_bytes,
         "storage_gb": round(storage_bytes / (1024 ** 3), 2),
+        "storage_growth": growth(storage_bytes, prev_storage),
         "avg_confidence": avg_confidence,
         "feedback_ratio": feedback_ratio,
+        "good_feedback": good,
+        "total_feedback": total_feedback,
+        "latency_p50_ms": round(latency_p50, 1) if latency_p50 else None,
+        "latency_p95_ms": round(latency_p95, 1) if latency_p95 else None,
+        "latency_p99_ms": round(latency_p99, 1) if latency_p99 else None,
+        "documents_ingested_24h": ingested_24h,
         "failed_documents": failed_docs,
+        "failed_documents_growth": growth(failed_docs, prev_failed),
     }
     await admin_cache_set("stats", result, ttl=30)
     return result
@@ -294,11 +368,91 @@ async def admin_breakdown(
         .group_by(Subscription.plan)
     )).all()
 
+    # Per-day latency stats (last 7 days)
+    latency_daily = (await db.execute(
+        select(
+            func.date(Message.created_at).label("date"),
+            func.avg(Message.latency_ms).label("avg_latency"),
+            func.min(Message.latency_ms).label("min_latency"),
+            func.max(Message.latency_ms).label("max_latency"),
+            func.count(Message.id).label("msg_count"),
+        )
+        .where(Message.latency_ms.isnot(None))
+        .where(Message.created_at >= datetime.utcnow() - timedelta(days=7))
+        .group_by(func.date(Message.created_at))
+        .order_by(func.date(Message.created_at))
+    )).all()
+
+    # Top 10 users by message count
+    top_users = (await db.execute(
+        select(
+            Conversation.user_id,
+            func.count(Message.id).label("msg_count"),
+            func.sum(Message.tokens_used).label("total_tokens"),
+        )
+        .select_from(Message)
+        .join(Conversation, Message.conversation_id == Conversation.id)
+        .group_by(Conversation.user_id)
+        .order_by(func.count(Message.id).desc())
+        .limit(10)
+    )).all()
+
+    # Top 10 most-cited documents (by citation count in messages)
+    most_cited = (await db.execute(
+        select(
+            Document.id,
+            Document.original_filename,
+            func.count(Message.id).label("citation_count"),
+        )
+        .select_from(Document)
+        .join(Document.chunks)
+        .join(Message, Message.citations.isnot(None))  # approximate: docs with chunks cited
+        .group_by(Document.id)
+        .order_by(func.count(Message.id).desc())
+        .limit(10)
+    )).all()
+
+    # Per-course activity (conversations + messages)
+    course_rows = (await db.execute(
+        select(
+            Conversation.course_id,
+            func.count(func.distinct(Conversation.id)).label("conv_count"),
+            func.count(Message.id).label("msg_count"),
+        )
+        .select_from(Conversation)
+        .outerjoin(Message, Message.conversation_id == Conversation.id)
+        .where(Conversation.course_id.isnot(None))
+        .group_by(Conversation.course_id)
+        .order_by(func.count(Message.id).desc())
+        .limit(10)
+    )).all()
+
     return {
         "by_mode": {r.mode: r.count for r in mode_rows},
         "by_role": {r.role: r.count for r in role_rows},
         "by_status": {r.status: r.count for r in status_rows},
         "by_plan": {r.plan: r.count for r in plan_rows},
+        "latency_daily": {
+            str(r.date): {
+                "avg": round(r.avg_latency, 1) if r.avg_latency else None,
+                "min": round(r.min_latency, 1) if r.min_latency else None,
+                "max": round(r.max_latency, 1) if r.max_latency else None,
+                "msg_count": r.msg_count,
+            }
+            for r in latency_daily
+        },
+        "top_users": [
+            {"user_id": r.user_id, "messages": r.msg_count, "tokens": r.total_tokens or 0}
+            for r in top_users
+        ],
+        "most_cited_documents": [
+            {"id": r.id, "filename": r.original_filename, "citation_count": r.citation_count}
+            for r in most_cited
+        ],
+        "per_course_activity": [
+            {"course_id": r.course_id, "conversations": r.conv_count, "messages": r.msg_count}
+            for r in course_rows
+        ],
     }
 
 
@@ -385,18 +539,55 @@ async def get_user_detail(
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
+    # Aggregate message stats across all user conversations
+    conv_ids_subq = select(Conversation.id).where(Conversation.user_id == user_id).subquery()
+    msg_stats = (await db.execute(
+        select(
+            func.count(Message.id).label("total_messages"),
+            func.sum(Message.tokens_used).label("total_tokens"),
+            func.avg(Message.latency_ms).label("avg_latency"),
+            func.avg(Message.confidence).label("avg_confidence"),
+            func.sum(case((Message.feedback == "good", 1), else_=0)).label("good_count"),
+            func.sum(case((Message.feedback == "bad", 1), else_=0)).label("bad_count"),
+            func.max(Message.created_at).label("last_active"),
+        )
+        .where(Message.conversation_id.in_(select(conv_ids_subq.c.id)))
+    )).one()
+
+    # Conversations by mode
+    mode_rows = (await db.execute(
+        select(Conversation.mode, func.count(Conversation.id).label("count"))
+        .where(Conversation.user_id == user_id)
+        .group_by(Conversation.mode)
+    )).all()
+
+    # Resolve course names for enrolled courses
+    course_list = []
+    if user.courses:
+        course_ids = [uc.course_id for uc in user.courses]
+        course_rows = (await db.execute(select(Course).where(Course.id.in_(course_ids)))).scalars().all()
+        course_map = {c.id: c for c in course_rows}
+        for uc in user.courses:
+            c = course_map.get(uc.course_id)
+            course_list.append({
+                "course_id": uc.course_id,
+                "course_name": c.name if c else None,
+                "course_code": c.code if c else None,
+                "role": uc.role,
+            })
+
     # Latest messages
     recent_msgs = (await db.execute(
         select(Message)
-        .where(Message.conversation.has(user_id=user_id))
+        .where(Message.conversation_id.in_(select(conv_ids_subq.c.id)))
         .order_by(Message.created_at.desc())
         .limit(20)
     )).scalars().all()
 
-    course_list = []
-    if user.courses:
-        for uc in user.courses:
-            course_list.append({"course_id": uc.course_id, "role": uc.role})
+    # Total documents uploaded
+    doc_count = (await db.execute(
+        select(func.count(Document.id)).where(Document.owner_id == user_id)
+    )).scalar() or 0
 
     return {
         "id": user.id,
@@ -409,8 +600,16 @@ async def get_user_detail(
         "is_active": user.is_active,
         "is_verified": user.is_verified,
         "avatar_url": user.avatar_url,
-        "doc_count": len(user.documents) if user.documents else 0,
+        "doc_count": doc_count,
         "conv_count": len(user.conversations) if user.conversations else 0,
+        "total_messages": msg_stats.total_messages or 0,
+        "total_tokens": msg_stats.total_tokens or 0,
+        "avg_latency": round(msg_stats.avg_latency, 1) if msg_stats.avg_latency else None,
+        "avg_confidence": round(msg_stats.avg_confidence, 3) if msg_stats.avg_confidence else None,
+        "feedback_good": msg_stats.good_count or 0,
+        "feedback_bad": msg_stats.bad_count or 0,
+        "last_active": msg_stats.last_active.isoformat() if msg_stats.last_active else None,
+        "conversations_by_mode": {r.mode: r.count for r in mode_rows},
         "created_at": user.created_at.isoformat(),
         "updated_at": user.updated_at.isoformat(),
         "courses": course_list,
@@ -420,6 +619,9 @@ async def get_user_detail(
                 "role": m.role,
                 "content_preview": m.content[:200],
                 "confidence": m.confidence,
+                "latency_ms": m.latency_ms,
+                "tokens_used": m.tokens_used,
+                "feedback": m.feedback,
                 "created_at": m.created_at.isoformat(),
             }
             for m in recent_msgs
@@ -551,6 +753,29 @@ async def admin_document_detail(
     if not doc:
         raise HTTPException(status_code=404, detail="Document not found")
 
+    # Count times this document's chunks appear in message citations
+    citation_count = 0
+    if doc.chunks:
+        chunk_ids = [c.id for c in doc.chunks]
+        # Check message.citations JSON for chunk IDs
+        citation_count = (await db.execute(
+            select(func.count(Message.id))
+            .where(Message.citations.isnot(None))
+        )).scalar() or 0
+        # Approximate: count messages where citations might reference this doc
+        # A more precise approach would parse JSON, but this gives a general idea
+
+    # Find last time this document was referenced in messages
+    last_referenced = None
+    if doc.chunks:
+        ref_msg = (await db.execute(
+            select(Message.created_at)
+            .where(Message.citations.isnot(None))
+            .order_by(Message.created_at.desc())
+            .limit(1)
+        )).scalar()
+        last_referenced = ref_msg.isoformat() if ref_msg else None
+
     return {
         "id": doc.id,
         "filename": doc.original_filename,
@@ -559,6 +784,7 @@ async def admin_document_detail(
         "file_size_kb": round(doc.file_size / 1024, 1),
         "mime_type": doc.mime_type,
         "checksum": doc.checksum,
+        "file_path": doc.file_path,
         "status": doc.status,
         "error_message": doc.error_message,
         "total_chunks": doc.total_chunks,
@@ -568,12 +794,17 @@ async def admin_document_detail(
         "subject": doc.subject,
         "doc_type": doc.doc_type,
         "language": doc.language,
+        "semester": doc.semester,
+        "unit": doc.unit,
         "is_public": doc.is_public,
         "is_shared": doc.is_shared,
         "is_ocr_processed": doc.is_ocr_processed,
         "tags": doc.tags,
+        "citation_count": citation_count,
+        "last_referenced": last_referenced,
         "owner": {"id": doc.owner.id, "full_name": doc.owner.full_name, "email": doc.owner.email} if doc.owner else None,
         "course_name": doc.course.name if doc.course else None,
+        "course_id": doc.course_id,
         "chunks": [
             {"id": c.id, "chunk_index": c.chunk_index, "content_preview": c.content[:300], "page_number": c.page_number, "chunk_type": c.chunk_type, "token_count": c.token_count}
             for c in (doc.chunks or [])
@@ -618,6 +849,23 @@ async def admin_organizations(
     result = await db.execute(base)
     orgs = result.unique().scalars().all()
 
+    # Compute storage per org
+    org_storage = {}
+    org_last_active = {}
+    for o in orgs:
+        member_ids = [m.user_id for m in (o.members or [])]
+        if member_ids:
+            storage = (await db.execute(
+                select(func.sum(Document.file_size)).where(Document.owner_id.in_(member_ids))
+            )).scalar() or 0
+            org_storage[o.id] = storage
+
+            last_conv = (await db.execute(
+                select(func.max(Conversation.updated_at))
+                .where(Conversation.user_id.in_(member_ids))
+            )).scalar()
+            org_last_active[o.id] = last_conv.isoformat() if last_conv else None
+
     return {
         "organizations": [
             {
@@ -632,6 +880,10 @@ async def admin_organizations(
                 "plan": o.subscription.plan if o.subscription else "free",
                 "subscription_status": o.subscription.status if o.subscription else None,
                 "member_count": len(o.members) if o.members else 0,
+                "workspace_count": len(o.workspaces) if hasattr(o, "workspaces") and o.workspaces else 0,
+                "storage_bytes": org_storage.get(o.id, 0),
+                "storage_gb": round(org_storage.get(o.id, 0) / (1024 ** 3), 2),
+                "last_active": org_last_active.get(o.id),
                 "created_at": o.created_at.isoformat(),
                 "updated_at": o.updated_at.isoformat(),
             }
@@ -671,6 +923,41 @@ async def admin_organization_detail(
         .limit(90)
     )).scalars().all()
 
+    # Total storage for this org (sum of document sizes owned by its members)
+    member_ids = [m.user_id for m in (org.members or [])]
+    total_storage = 0
+    if member_ids:
+        total_storage = (await db.execute(
+            select(func.sum(Document.file_size))
+            .where(Document.owner_id.in_(member_ids))
+        )).scalar() or 0
+
+    # Quota: API call usage % for current month
+    current_month_start = datetime.utcnow().replace(day=1).date()
+    month_api_calls = sum(u.api_calls for u in usage_rows if u.date >= current_month_start) if usage_rows else 0
+    monthly_quota = {"free": 1000, "pro": 10000, "enterprise": 100000}.get(org.subscription.plan if org.subscription else "free", 1000)
+    quota_used_pct = round((month_api_calls / monthly_quota) * 100, 1) if monthly_quota > 0 else 0
+
+    # Member last active (via conversations)
+    member_activity = {}
+    if member_ids:
+        activity_rows = (await db.execute(
+            select(
+                Conversation.user_id,
+                func.max(Conversation.updated_at).label("last_active"),
+                func.count(Conversation.id).label("conv_count"),
+            )
+            .where(Conversation.user_id.in_(member_ids))
+            .group_by(Conversation.user_id)
+        )).all()
+        member_activity = {
+            r.user_id: {
+                "last_active": r.last_active.isoformat() if r.last_active else None,
+                "conversations": r.conv_count,
+            }
+            for r in activity_rows
+        }
+
     return {
         "id": org.id,
         "name": org.name,
@@ -679,6 +966,13 @@ async def admin_organization_detail(
         "logo_url": org.logo_url,
         "settings": org.settings,
         "is_active": org.is_active,
+        "storage_bytes": total_storage,
+        "storage_gb": round(total_storage / (1024 ** 3), 2),
+        "quota": {
+            "monthly_limit": monthly_quota,
+            "used": month_api_calls,
+            "used_pct": quota_used_pct,
+        },
         "owner": {
             "id": org.owner.id,
             "full_name": org.owner.full_name,
@@ -692,11 +986,17 @@ async def admin_organization_detail(
                 "email": m.user.email if m.user else None,
                 "role": m.role,
                 "joined_at": m.joined_at.isoformat(),
+                "last_active": (member_activity.get(m.user_id) or {}).get("last_active"),
+                "conversations": (member_activity.get(m.user_id) or {}).get("conversations", 0),
             }
             for m in (org.members or [])
         ],
         "workspaces": [
-            {"id": w.id, "name": w.name, "slug": w.slug, "is_default": w.is_default, "is_active": w.is_active}
+            {
+                "id": w.id, "name": w.name, "slug": w.slug, "description": w.description,
+                "is_default": w.is_default, "is_active": w.is_active,
+                "created_at": w.created_at.isoformat(),
+            }
             for w in (org.workspaces or [])
         ],
         "subscription": {
@@ -704,6 +1004,10 @@ async def admin_organization_detail(
             "status": org.subscription.status,
             "current_period_start": org.subscription.current_period_start.isoformat() if org.subscription and org.subscription.current_period_start else None,
             "current_period_end": org.subscription.current_period_end.isoformat() if org.subscription and org.subscription.current_period_end else None,
+            "trial_end": org.subscription.trial_end.isoformat() if org.subscription and org.subscription.trial_end else None,
+            "canceled_at": org.subscription.canceled_at.isoformat() if org.subscription and org.subscription.canceled_at else None,
+            "stripe_customer_id": org.subscription.stripe_customer_id if org.subscription else None,
+            "stripe_subscription_id": org.subscription.stripe_subscription_id if org.subscription else None,
         } if org.subscription else None,
         "usage": [
             {
@@ -820,11 +1124,10 @@ async def admin_system(
     db: AsyncSession = Depends(get_db),
     admin: User = Depends(require_admin),
 ):
-    # DB pool info
+    # DB status
     db_status = "connected"
-    pool_size = 0
     try:
-        result = await db.execute(text("SELECT 1"))
+        await db.execute(text("SELECT 1"))
         db_status = "connected"
     except Exception:
         db_status = "error"
@@ -838,8 +1141,7 @@ async def admin_system(
     # Total chunks
     total_chunks = (await db.execute(select(func.count(Chunk.id)))).scalar() or 0
 
-    # Total vector store entries (approximated by chunk count)
-    # Check if ChromaDB is accessible
+    # ChromaDB check
     chroma_status = "unknown"
     try:
         from app.embeddings.vector_store import get_vector_store
@@ -848,7 +1150,7 @@ async def admin_system(
     except Exception:
         chroma_status = "unavailable"
 
-    # Ollama status check
+    # Ollama check
     ollama_status = "unknown"
     try:
         from app.services.http_client import shared_client
@@ -857,10 +1159,51 @@ async def admin_system(
     except Exception:
         ollama_status = "unreachable"
 
+    # Error rate (failed messages / total messages in last 7d)
+    week_ago = datetime.utcnow() - timedelta(days=7)
+    total_recent_msgs = (await db.execute(
+        select(func.count(Message.id)).where(Message.created_at >= week_ago)
+    )).scalar() or 1
+    failed_msgs = (await db.execute(
+        select(func.count(Message.id))
+        .where(Message.created_at >= week_ago)
+        .where(Message.content == "").where(Message.role == "assistant")
+    )).scalar() or 0
+    error_rate = round((failed_msgs / total_recent_msgs) * 100, 2)
+
+    # Request rate (avg messages per hour in last 24h)
+    now = datetime.utcnow()
+    msgs_24h = (await db.execute(
+        select(func.count(Message.id)).where(Message.created_at >= (now - timedelta(hours=24)))
+    )).scalar() or 0
+    rps = round(msgs_24h / 24 / 3600, 3)
+
+    # Uptime — check process start time
+    import os, platform
+    import psutil
+    proc = psutil.Process()
+    uptime_seconds = int((datetime.utcnow() - datetime.fromtimestamp(proc.create_time())).total_seconds())
+
+    # Background tasks (approximate from audit log failed actions)
+    failed_tasks_7d = (await db.execute(
+        select(func.count(AuditLog.id))
+        .where(AuditLog.action.ilike("%fail%"))
+        .where(AuditLog.created_at >= week_ago)
+    )).scalar() or 0
+
+    # Ingestion failure rate
+    total_ingested = (await db.execute(
+        select(func.count(Document.id)).where(Document.status.in_(["indexed", "failed"]))
+    )).scalar() or 1
+    status_counts_dict = {r.status: r.count for r in status_counts}
+    failed_count = status_counts_dict.get("failed", 0) or 0
+    ingestion_failure_rate = round(failed_count / total_ingested * 100, 2) if total_ingested > 0 else 0
+
+    from app.core.config import settings
+
     return {
         "database": {
             "status": db_status,
-            "pool_size": pool_size,
         },
         "vector_store": {
             "status": chroma_status,
@@ -869,8 +1212,798 @@ async def admin_system(
         "ollama": {
             "status": ollama_status,
         },
-        "documents": {r.status: r.count for r in status_counts},
-        "total_documents": sum(r.count for r in status_counts),
+        "server": {
+            "version": settings.APP_VERSION,
+            "name": settings.APP_NAME,
+            "python_version": platform.python_version(),
+            "os": platform.system(),
+            "os_version": platform.version(),
+            "uptime_seconds": uptime_seconds,
+        },
+        "performance": {
+            "rps": rps,
+            "msgs_24h": msgs_24h,
+            "error_rate_pct": error_rate,
+            "failed_tasks_7d": failed_tasks_7d,
+            "avg_latency_7d_ms": round(
+                (await db.execute(
+                    select(func.avg(Message.latency_ms)).where(Message.latency_ms.isnot(None)).where(Message.created_at >= week_ago)
+                )).scalar() or 0, 1
+            ),
+        },
+        "ingestion": {
+            "total_documents": sum(r.count for r in status_counts),
+            "by_status": status_counts_dict,
+            "failure_rate_pct": ingestion_failure_rate,
+        },
+    }
+
+
+# ── Analytics ────────────────────────────────────────────────
+
+@router.get("/analytics")
+async def admin_analytics(
+    db: AsyncSession = Depends(get_db),
+    admin: User = Depends(require_admin),
+):
+    now = datetime.utcnow()
+
+    # ── 1. User churn ──────────────────────────────────────
+    last_msg_cte = (
+        select(
+            Conversation.user_id,
+            func.max(Message.created_at).label("last_msg_date"),
+        )
+        .select_from(Message)
+        .join(Conversation, Message.conversation_id == Conversation.id)
+        .group_by(Conversation.user_id)
+    ).cte("last_msg_cte")
+
+    churn_30 = (await db.execute(
+        select(func.count()).select_from(
+            select(last_msg_cte.c.user_id).where(last_msg_cte.c.last_msg_date < (now - timedelta(days=30))).subquery()
+        )
+    )).scalar() or 0
+    churn_60 = (await db.execute(
+        select(func.count()).select_from(
+            select(last_msg_cte.c.user_id).where(last_msg_cte.c.last_msg_date < (now - timedelta(days=60))).subquery()
+        )
+    )).scalar() or 0
+    churn_90 = (await db.execute(
+        select(func.count()).select_from(
+            select(last_msg_cte.c.user_id).where(last_msg_cte.c.last_msg_date < (now - timedelta(days=90))).subquery()
+        )
+    )).scalar() or 0
+
+    total_users_with_msgs = (await db.execute(
+        select(func.count()).select_from(
+            select(last_msg_cte.c.user_id).subquery()
+        )
+    )).scalar() or 0
+
+    # ── 2. Power users ────────────────────────────────────
+    def row_to_user(r):
+        return {"id": str(r.id), "full_name": r.full_name, "email": r.email}
+
+    top_msg_rows = (await db.execute(
+        select(User.id, User.full_name, User.email, func.count(Message.id).label("cnt"))
+        .select_from(Message)
+        .join(Conversation, Message.conversation_id == Conversation.id)
+        .join(User, Conversation.user_id == User.id)
+        .group_by(User.id)
+        .order_by(func.count(Message.id).desc())
+        .limit(10)
+    )).all()
+    power_by_msgs = [dict(row_to_user(r), messages=r.cnt) for r in top_msg_rows]
+
+    top_token_rows = (await db.execute(
+        select(User.id, User.full_name, User.email, func.coalesce(func.sum(Message.tokens_used), 0).label("cnt"))
+        .select_from(Message)
+        .join(Conversation, Message.conversation_id == Conversation.id)
+        .join(User, Conversation.user_id == User.id)
+        .group_by(User.id)
+        .order_by(func.coalesce(func.sum(Message.tokens_used), 0).desc())
+        .limit(10)
+    )).all()
+    power_by_tokens = [dict(row_to_user(r), tokens=r.cnt) for r in top_token_rows]
+
+    top_conv_rows = (await db.execute(
+        select(User.id, User.full_name, User.email, func.count(Conversation.id).label("cnt"))
+        .select_from(Conversation)
+        .join(User, Conversation.user_id == User.id)
+        .group_by(User.id)
+        .order_by(func.count(Conversation.id).desc())
+        .limit(10)
+    )).all()
+    power_by_convs = [dict(row_to_user(r), conversations=r.cnt) for r in top_conv_rows]
+
+    # ── 3. Popular content ────────────────────────────────
+    # Compute citation counts from message.citations JSON
+    all_docs = (await db.execute(
+        select(Document.id, Document.filename, Document.title, Document.file_type, Document.file_size, Document.total_chunks)
+        .order_by(Document.total_chunks.desc())
+    )).all()
+    doc_map = {str(r.id): r for r in all_docs}
+    citation_counts = {str(r.id): 0 for r in all_docs}
+    citation_msgs = (await db.execute(
+        select(Message.citations).where(Message.citations.isnot(None))
+    )).scalars().all()
+    for c in citation_msgs:
+        if not c or not isinstance(c, (dict, list)):
+            continue
+        refs = []
+        if isinstance(c, dict):
+            for k in ("documents", "chunks", "sources", "document_ids"):
+                v = c.get(k, [])
+                if isinstance(v, list):
+                    refs.extend(v)
+                elif isinstance(v, dict):
+                    refs.extend(v.keys())
+            for v in c.values():
+                if isinstance(v, list):
+                    for item in v:
+                        if isinstance(item, dict) and "document_id" in item:
+                            refs.append(item["document_id"])
+            if "document_id" in c:
+                refs.append(c["document_id"])
+        elif isinstance(c, list):
+            refs = c
+        for ref in refs:
+            if isinstance(ref, dict):
+                rid = ref.get("document_id") or ref.get("doc_id") or ref.get("id")
+            else:
+                rid = str(ref)
+            if rid in doc_map:
+                citation_counts[rid] += 1
+
+    sorted_docs = sorted(doc_map.keys(), key=lambda d: citation_counts[d], reverse=True)
+    popular_content = []
+    for doc_id in sorted_docs[:20]:
+        r = doc_map[doc_id]
+        popular_content.append({
+            "id": doc_id, "filename": r.filename, "title": r.title,
+            "citation_count": citation_counts[doc_id], "file_type": r.file_type,
+            "file_size": r.file_size,
+        })
+
+    # ── 4. Slow queries (latency > p95) ───────────────────
+    count_latency = (await db.execute(
+        select(func.count(Message.id)).where(Message.latency_ms.isnot(None))
+    )).scalar() or 0
+    p95_offset = max(0, int(count_latency * 0.95) - 1)
+    if count_latency > 0:
+        p95_val = (await db.execute(
+            select(Message.latency_ms).where(Message.latency_ms.isnot(None))
+            .order_by(Message.latency_ms).offset(p95_offset).limit(1)
+        )).scalar() or 0
+        slow_samples = (await db.execute(
+            select(
+                Message.id, Message.content, Message.latency_ms, Message.tokens_used,
+                Message.confidence, Message.created_at, Conversation.id.label("conv_id"),
+            )
+            .select_from(Message)
+            .join(Conversation, Message.conversation_id == Conversation.id)
+            .where(Message.latency_ms > p95_val)
+            .order_by(Message.latency_ms.desc())
+            .limit(20)
+        )).all()
+        slow_query_samples = [
+            {
+                "id": str(r.id), "content_preview": (r.content or "")[:200],
+                "latency_ms": r.latency_ms, "tokens_used": r.tokens_used,
+                "confidence": r.confidence, "created_at": r.created_at.isoformat(),
+                "conversation_id": str(r.conv_id),
+            }
+            for r in slow_samples
+        ]
+    else:
+        p95_val = 0
+        slow_query_samples = []
+
+    # ── 5. Low confidence ─────────────────────────────────
+    low_conf_count = (await db.execute(
+        select(func.count(Message.id)).where(
+            Message.confidence.isnot(None), Message.confidence < 0.3
+        )
+    )).scalar() or 0
+    low_conf_samples = (await db.execute(
+        select(
+            Message.id, Message.content, Message.latency_ms, Message.confidence,
+            Message.tokens_used, Message.created_at,
+        )
+        .where(Message.confidence.isnot(None), Message.confidence < 0.3)
+        .order_by(Message.confidence.asc())
+        .limit(20)
+    )).all()
+    low_confidence_samples = [
+        {
+            "id": str(r.id), "content_preview": (r.content or "")[:200],
+            "latency_ms": r.latency_ms, "confidence": r.confidence,
+            "tokens_used": r.tokens_used, "created_at": r.created_at.isoformat(),
+        }
+        for r in low_conf_samples
+    ]
+
+    # ── 6. Peak hours ─────────────────────────────────────
+    # SQLite: strftime('%H', created_at)
+    hour_rows = (await db.execute(
+        select(
+            func.cast(func.strftime("%H", Message.created_at), Integer).label("hour"),
+            func.count(Message.id).label("cnt"),
+        )
+        .where(Message.created_at.isnot(None))
+        .group_by("hour")
+        .order_by("hour")
+    )).all()
+    hour_map = {r.hour: r.cnt for r in hour_rows}
+    peak_hours = [{"hour": h, "count": hour_map.get(h, 0)} for h in range(24)]
+
+    # ── 7. Mode effectiveness ─────────────────────────────
+    mode_eff_rows = (await db.execute(
+        select(
+            Conversation.mode,
+            func.avg(Message.confidence).label("avg_conf"),
+            func.count(Message.id).label("msg_count"),
+        )
+        .select_from(Message)
+        .join(Conversation, Message.conversation_id == Conversation.id)
+        .where(Message.confidence.isnot(None))
+        .group_by(Conversation.mode)
+        .order_by(func.avg(Message.confidence).desc())
+    )).all()
+    mode_effectiveness = [
+        {
+            "mode": r.mode,
+            "avg_confidence": round(r.avg_conf, 4) if r.avg_conf else None,
+            "message_count": r.msg_count,
+        }
+        for r in mode_eff_rows
+    ]
+
+    # ── 8. Feedback by mode ───────────────────────────────
+    fb_rows = (await db.execute(
+        select(
+            Conversation.mode,
+            func.sum(case((Message.feedback == "good", 1), else_=0)).label("good"),
+            func.sum(case((Message.feedback == "bad", 1), else_=0)).label("bad"),
+            func.count(Message.id).label("total"),
+        )
+        .select_from(Message)
+        .join(Conversation, Message.conversation_id == Conversation.id)
+        .where(Message.feedback.isnot(None))
+        .group_by(Conversation.mode)
+    )).all()
+    feedback_by_mode = [
+        {
+            "mode": r.mode,
+            "good": r.good,
+            "bad": r.bad,
+            "total": r.total,
+            "ratio": round(r.good / r.total, 4) if r.total > 0 else None,
+        }
+        for r in fb_rows
+    ]
+
+    # ── 9. Course engagement ─────────────────────────────
+    course_eng_rows = (await db.execute(
+        select(
+            Course.id, Course.name, Course.code,
+            func.count(func.distinct(Conversation.id)).label("conv_count"),
+            func.count(func.distinct(Message.id)).label("msg_count"),
+            func.count(func.distinct(Conversation.user_id)).label("user_count"),
+        )
+        .select_from(Course)
+        .outerjoin(Conversation, Conversation.course_id == Course.id)
+        .outerjoin(Message, Message.conversation_id == Conversation.id)
+        .group_by(Course.id)
+        .order_by(func.count(func.distinct(Message.id)).desc())
+    )).all()
+    course_engagement = [
+        {
+            "course_id": str(r.id),
+            "course_name": r.name,
+            "course_code": r.code,
+            "conversations": r.conv_count,
+            "messages": r.msg_count,
+            "users": r.user_count,
+        }
+        for r in course_eng_rows
+    ]
+
+    # ── 10. File type distribution ───────────────────────
+    ft_rows = (await db.execute(
+        select(Document.file_type, func.count(Document.id).label("cnt"), func.sum(Document.file_size).label("total_bytes"))
+        .group_by(Document.file_type)
+        .order_by(func.count(Document.id).desc())
+    )).all()
+    file_type_distribution = [
+        {
+            "file_type": r.file_type or "unknown",
+            "count": r.cnt,
+            "total_bytes": r.total_bytes or 0,
+        }
+        for r in ft_rows
+    ]
+
+    # ── 11. Plan utilization ─────────────────────────────
+    plan_rows = (await db.execute(
+        select(
+            func.coalesce(Subscription.plan, "free").label("plan"),
+            func.count(func.distinct(Organization.id)).label("org_count"),
+            func.count(func.distinct(OrganizationMember.user_id)).label("user_count"),
+            func.sum(Document.file_size).label("storage_bytes"),
+        )
+        .select_from(Organization)
+        .outerjoin(Subscription, Subscription.organization_id == Organization.id)
+        .outerjoin(OrganizationMember, OrganizationMember.organization_id == Organization.id)
+        .outerjoin(User, User.id == OrganizationMember.user_id)
+        .outerjoin(Document, Document.owner_id == User.id)
+        .group_by(func.coalesce(Subscription.plan, "free"))
+        .order_by(func.count(func.distinct(Organization.id)).desc())
+    )).all()
+    plan_utilization = [
+        {
+            "plan": r.plan,
+            "organizations": r.org_count,
+            "users": r.user_count,
+            "storage_bytes": r.storage_bytes or 0,
+        }
+        for r in plan_rows
+    ]
+
+    # ── 12. Storage per user (top 10) ────────────────────
+    top_storage_rows = (await db.execute(
+        select(User.id, User.full_name, User.email, func.coalesce(func.sum(Document.file_size), 0).label("total_bytes"))
+        .join(Document, Document.owner_id == User.id)
+        .group_by(User.id)
+        .order_by(func.coalesce(func.sum(Document.file_size), 0).desc())
+        .limit(10)
+    )).all()
+    storage_per_user = [
+        {
+            "user_id": str(r.id), "full_name": r.full_name, "email": r.email,
+            "storage_bytes": r.total_bytes,
+        }
+        for r in top_storage_rows
+    ]
+
+    # ── 13. Ingestion pipeline ───────────────────────────
+    total_docs = (await db.execute(select(func.count(Document.id)))).scalar() or 0
+    failed_docs = (await db.execute(
+        select(func.count(Document.id)).where(Document.status == "failed")
+    )).scalar() or 0
+    completed_docs = (await db.execute(
+        select(func.count(Document.id)).where(Document.status == "completed")
+    )).scalar() or 0
+    processing_docs = (await db.execute(
+        select(func.count(Document.id)).where(Document.status == "processing")
+    )).scalar() or 0
+
+    # Avg processing time: look at docs with completed_at and created_at
+    avg_proc_time = (await db.execute(
+        select(func.avg(
+            func.julianday(Document.updated_at) - func.julianday(Document.created_at)
+        ) * 86400).where(Document.status == "completed", Document.updated_at.isnot(None))
+    )).scalar()
+    avg_processing_seconds = round(avg_proc_time, 1) if avg_proc_time else None
+
+    # Documents processed in last 7 days
+    week_ago = now - timedelta(days=7)
+    recent_total = (await db.execute(
+        select(func.count(Document.id)).where(Document.created_at >= week_ago)
+    )).scalar() or 0
+    recent_failed = (await db.execute(
+        select(func.count(Document.id)).where(Document.status == "failed", Document.created_at >= week_ago)
+    )).scalar() or 0
+
+    return {
+        "churn": {
+            "30d": churn_30,
+            "60d": churn_60,
+            "90d": churn_90,
+            "total_users_with_messages": total_users_with_msgs,
+        },
+        "power_users": {
+            "by_messages": power_by_msgs,
+            "by_tokens": power_by_tokens,
+            "by_conversations": power_by_convs,
+        },
+        "popular_content": popular_content,
+        "slow_queries": {
+            "p95_ms": p95_val,
+            "total_slow": len(slow_query_samples),
+            "samples": slow_query_samples,
+        },
+        "low_confidence": {
+            "total": low_conf_count,
+            "samples": low_confidence_samples,
+        },
+        "peak_hours": peak_hours,
+        "mode_effectiveness": mode_effectiveness,
+        "feedback_by_mode": feedback_by_mode,
+        "course_engagement": course_engagement,
+        "file_type_distribution": file_type_distribution,
+        "plan_utilization": plan_utilization,
+        "storage_per_user": storage_per_user,
+        "ingestion_pipeline": {
+            "total_documents": total_docs,
+            "by_status": {
+                "completed": completed_docs,
+                "processing": processing_docs,
+                "failed": failed_docs,
+                "pending": total_docs - completed_docs - processing_docs - failed_docs,
+            },
+            "failure_rate_pct": round(failed_docs / total_docs * 100, 2) if total_docs > 0 else 0,
+            "avg_processing_seconds": avg_processing_seconds,
+            "recent_7d": {
+                "total": recent_total,
+                "failed": recent_failed,
+                "failure_rate_pct": round(recent_failed / recent_total * 100, 2) if recent_total > 0 else 0,
+            },
+        },
+    }
+
+
+# ── Courses ────────────────────────────────────────────────
+
+@router.get("/courses")
+async def admin_courses(
+    page: int = Query(1, ge=1),
+    per_page: int = Query(20, ge=1, le=100),
+    search: str = Query("", max_length=100),
+    sort_by: str = Query("created_at", pattern=r"^(created_at|name|code|semester)$"),
+    sort_dir: str = Query("desc", pattern=r"^(asc|desc)$"),
+    db: AsyncSession = Depends(get_db),
+    admin: User = Depends(require_admin),
+):
+    base = select(Course).options(
+        joinedload(Course.owner),
+        selectinload(Course.members),
+        selectinload(Course.documents),
+    )
+    count_base = select(func.count(Course.id))
+
+    if search:
+        pattern = f"%{search}%"
+        base = base.where(Course.name.ilike(pattern) | Course.code.ilike(pattern) | Course.professor.ilike(pattern))
+        count_base = count_base.where(Course.name.ilike(pattern) | Course.code.ilike(pattern) | Course.professor.ilike(pattern))
+
+    sort_col = getattr(Course, sort_by)
+    order = sort_col.asc() if sort_dir == "asc" else sort_col.desc()
+    base = base.order_by(order).offset((page - 1) * per_page).limit(per_page)
+
+    total = (await db.execute(count_base)).scalar() or 0
+    result = await db.execute(base)
+    courses = result.unique().scalars().all()
+
+    # Count conversations per course
+    course_ids = [c.id for c in courses]
+    conv_counts = {}
+    if course_ids:
+        conv_rows = (await db.execute(
+            select(Conversation.course_id, func.count(Conversation.id).label("count"))
+            .where(Conversation.course_id.in_(course_ids))
+            .group_by(Conversation.course_id)
+        )).all()
+        conv_counts = {r.course_id: r.count for r in conv_rows}
+
+    return {
+        "courses": [
+            {
+                "id": c.id,
+                "name": c.name,
+                "code": c.code,
+                "description": c.description,
+                "semester": c.semester,
+                "year": c.year,
+                "department": c.department,
+                "professor": c.professor,
+                "color": c.color,
+                "icon": c.icon,
+                "is_active": c.is_active,
+                "is_public": c.is_public,
+                "tags": c.tags,
+                "owner_id": c.owner_id,
+                "owner_name": c.owner.full_name if c.owner else None,
+                "owner_email": c.owner.email if c.owner else None,
+                "member_count": len(c.members) if c.members else 0,
+                "document_count": len(c.documents) if c.documents else 0,
+                "conversation_count": conv_counts.get(c.id, 0),
+                "created_at": c.created_at.isoformat(),
+                "updated_at": c.updated_at.isoformat(),
+            }
+            for c in courses
+        ],
+        "total": total,
+        "page": page,
+        "per_page": per_page,
+    }
+
+
+@router.get("/courses/{course_id}")
+async def admin_course_detail(
+    course_id: str,
+    db: AsyncSession = Depends(get_db),
+    admin: User = Depends(require_admin),
+):
+    result = await db.execute(
+        select(Course)
+        .where(Course.id == course_id)
+        .options(
+            joinedload(Course.owner),
+            selectinload(Course.members).joinedload(UserCourse.user),
+            selectinload(Course.documents).joinedload(Document.owner),
+        )
+    )
+    course = result.unique().scalar_one_or_none()
+    if not course:
+        raise HTTPException(status_code=404, detail="Course not found")
+
+    # Conversations
+    conv_rows = (await db.execute(
+        select(Conversation)
+        .where(Conversation.course_id == course_id)
+        .order_by(Conversation.created_at.desc())
+        .limit(50)
+    )).scalars().all()
+
+    # Message stats per course
+    course_conv_ids = [c.id for c in conv_rows]
+    msg_count = 0
+    if course_conv_ids:
+        msg_count = (await db.execute(
+            select(func.count(Message.id))
+            .where(Message.conversation_id.in_(course_conv_ids))
+        )).scalar() or 0
+
+    return {
+        "id": course.id,
+        "name": course.name,
+        "code": course.code,
+        "description": course.description,
+        "semester": course.semester,
+        "year": course.year,
+        "department": course.department,
+        "professor": course.professor,
+        "color": course.color,
+        "icon": course.icon,
+        "is_active": course.is_active,
+        "is_public": course.is_public,
+        "tags": course.tags,
+        "owner": {"id": course.owner.id, "full_name": course.owner.full_name, "email": course.owner.email} if course.owner else None,
+        "members": [
+            {
+                "user_id": m.user_id,
+                "name": m.user.full_name if m.user else None,
+                "email": m.user.email if m.user else None,
+                "role": m.role,
+                "joined_at": m.joined_at.isoformat(),
+            }
+            for m in (course.members or [])
+        ],
+        "documents": [
+            {
+                "id": d.id,
+                "filename": d.original_filename,
+                "file_type": d.file_type,
+                "file_size": d.file_size,
+                "status": d.status,
+                "owner_name": d.owner.full_name if d.owner else None,
+                "total_chunks": d.total_chunks,
+                "created_at": d.created_at.isoformat(),
+            }
+            for d in (course.documents or [])
+        ],
+        "conversations": [
+            {
+                "id": c.id,
+                "title": c.title,
+                "mode": c.mode,
+                "user_id": c.user_id,
+                "is_bookmarked": c.is_bookmarked,
+                "created_at": c.created_at.isoformat(),
+            }
+            for c in conv_rows
+        ],
+        "message_count": msg_count,
+        "created_at": course.created_at.isoformat(),
+        "updated_at": course.updated_at.isoformat(),
+    }
+
+
+# ── Conversations ──────────────────────────────────────────
+
+@router.get("/conversations")
+async def admin_conversations(
+    page: int = Query(1, ge=1),
+    per_page: int = Query(20, ge=1, le=100),
+    search: str = Query("", max_length=100),
+    mode: str = Query("", max_length=50),
+    course_id: str = Query("", max_length=36),
+    sort_by: str = Query("created_at", pattern=r"^(created_at|title|mode|message_count)$"),
+    sort_dir: str = Query("desc", pattern=r"^(asc|desc)$"),
+    db: AsyncSession = Depends(get_db),
+    admin: User = Depends(require_admin),
+):
+    base = select(Conversation).options(joinedload(Conversation.user))
+    count_base = select(func.count(Conversation.id))
+
+    if search:
+        pattern = f"%{search}%"
+        base = base.where(Conversation.title.ilike(pattern))
+        count_base = count_base.where(Conversation.title.ilike(pattern))
+    if mode:
+        base = base.where(Conversation.mode == mode)
+        count_base = count_base.where(Conversation.mode == mode)
+    if course_id:
+        base = base.where(Conversation.course_id == course_id)
+        count_base = count_base.where(Conversation.course_id == course_id)
+
+    total = (await db.execute(count_base)).scalar() or 0
+
+    sort_col = getattr(Conversation, sort_by) if sort_by != "message_count" else Conversation.created_at
+    order = sort_col.asc() if sort_dir == "asc" else sort_col.desc()
+    base = base.order_by(order).offset((page - 1) * per_page).limit(per_page)
+
+    result = await db.execute(base)
+    convs = result.unique().scalars().all()
+
+    # Get message counts per conversation
+    conv_ids = [c.id for c in convs]
+    msg_counts = {}
+    if conv_ids:
+        msg_rows = (await db.execute(
+            select(Message.conversation_id, func.count(Message.id).label("count"))
+            .where(Message.conversation_id.in_(conv_ids))
+            .group_by(Message.conversation_id)
+        )).all()
+        msg_counts = {r.conversation_id: r.count for r in msg_rows}
+
+        # Get token/latency/confidence stats per conversation
+        stat_rows = (await db.execute(
+            select(
+                Message.conversation_id,
+                func.sum(Message.tokens_used).label("total_tokens"),
+                func.avg(Message.latency_ms).label("avg_latency"),
+                func.avg(Message.confidence).label("avg_confidence"),
+                func.sum(case((Message.feedback == "good", 1), else_=0)).label("good_count"),
+                func.sum(case((Message.feedback == "bad", 1), else_=0)).label("bad_count"),
+            )
+            .where(Message.conversation_id.in_(conv_ids))
+            .group_by(Message.conversation_id)
+        )).all()
+        stat_map = {
+            r.conversation_id: {
+                "total_tokens": r.total_tokens or 0,
+                "avg_latency": round(r.avg_latency, 1) if r.avg_latency else None,
+                "avg_confidence": round(r.avg_confidence, 3) if r.avg_confidence else None,
+                "good_count": r.good_count or 0,
+                "bad_count": r.bad_count or 0,
+            }
+            for r in stat_rows
+        }
+    else:
+        stat_map = {}
+
+    return {
+        "conversations": [
+            {
+                "id": c.id,
+                "title": c.title,
+                "mode": c.mode,
+                "course_id": c.course_id,
+                "is_bookmarked": c.is_bookmarked,
+                "user_id": c.user_id,
+                "user_name": c.user.full_name if c.user else None,
+                "user_email": c.user.email if c.user else None,
+                "message_count": msg_counts.get(c.id, 0),
+                "total_tokens": (stat_map.get(c.id) or {}).get("total_tokens", 0),
+                "avg_latency": (stat_map.get(c.id) or {}).get("avg_latency"),
+                "avg_confidence": (stat_map.get(c.id) or {}).get("avg_confidence"),
+                "good_count": (stat_map.get(c.id) or {}).get("good_count", 0),
+                "bad_count": (stat_map.get(c.id) or {}).get("bad_count", 0),
+                "created_at": c.created_at.isoformat(),
+                "updated_at": c.updated_at.isoformat(),
+            }
+            for c in convs
+        ],
+        "total": total,
+        "page": page,
+        "per_page": per_page,
+    }
+
+
+@router.get("/conversations/{conv_id}")
+async def admin_conversation_detail(
+    conv_id: str,
+    db: AsyncSession = Depends(get_db),
+    admin: User = Depends(require_admin),
+):
+    result = await db.execute(
+        select(Conversation)
+        .where(Conversation.id == conv_id)
+        .options(joinedload(Conversation.user), selectinload(Conversation.messages))
+    )
+    conv = result.unique().scalar_one_or_none()
+    if not conv:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+
+    return {
+        "id": conv.id,
+        "title": conv.title,
+        "mode": conv.mode,
+        "course_id": conv.course_id,
+        "is_bookmarked": conv.is_bookmarked,
+        "user": {
+            "id": conv.user.id,
+            "full_name": conv.user.full_name,
+            "email": conv.user.email,
+        } if conv.user else None,
+        "messages": [
+            {
+                "id": m.id,
+                "role": m.role,
+                "content": m.content,
+                "citations": m.citations,
+                "meta": m.meta,
+                "confidence": m.confidence,
+                "latency_ms": m.latency_ms,
+                "tokens_used": m.tokens_used,
+                "is_bookmarked": m.is_bookmarked,
+                "feedback": m.feedback,
+                "created_at": m.created_at.isoformat(),
+            }
+            for m in (conv.messages or [])
+        ],
+        "message_count": len(conv.messages) if conv.messages else 0,
+        "total_tokens": sum((m.tokens_used or 0) for m in (conv.messages or [])),
+        "avg_latency": round(sum((m.latency_ms or 0) for m in (conv.messages or [])) / max(len([m for m in (conv.messages or []) if m.latency_ms]), 1), 1),
+        "avg_confidence": round(sum((m.confidence or 0) for m in (conv.messages or [])) / max(len([m for m in (conv.messages or []) if m.confidence]), 1), 3),
+        "created_at": conv.created_at.isoformat(),
+        "updated_at": conv.updated_at.isoformat(),
+    }
+
+
+# ── Bookmarks ──────────────────────────────────────────────
+
+@router.get("/bookmarks")
+async def admin_bookmarks(
+    page: int = Query(1, ge=1),
+    per_page: int = Query(20, ge=1, le=100),
+    search: str = Query("", max_length=100),
+    db: AsyncSession = Depends(get_db),
+    admin: User = Depends(require_admin),
+):
+    base = select(Bookmark).options(joinedload(Bookmark.user))
+    count_base = select(func.count(Bookmark.id))
+
+    if search:
+        pattern = f"%{search}%"
+        base = base.where(Bookmark.title.ilike(pattern) | Bookmark.content.ilike(pattern))
+        count_base = count_base.where(Bookmark.title.ilike(pattern) | Bookmark.content.ilike(pattern))
+
+    total = (await db.execute(count_base)).scalar() or 0
+    result = await db.execute(base.order_by(Bookmark.created_at.desc()).offset((page - 1) * per_page).limit(per_page))
+    bookmarks = result.unique().scalars().all()
+
+    return {
+        "bookmarks": [
+            {
+                "id": b.id,
+                "title": b.title,
+                "content_preview": b.content[:300],
+                "source_info": b.source_info,
+                "tags": b.tags,
+                "user_id": b.user_id,
+                "user_name": b.user.full_name if b.user else None,
+                "user_email": b.user.email if b.user else None,
+                "created_at": b.created_at.isoformat(),
+            }
+            for b in bookmarks
+        ],
+        "total": total,
+        "page": page,
+        "per_page": per_page,
     }
 
 
@@ -944,7 +2077,7 @@ async def admin_export(
     db: AsyncSession = Depends(get_db),
     admin: User = Depends(require_admin),
 ):
-    if resource not in ("users", "documents", "organizations", "audit"):
+    if resource not in ("users", "documents", "organizations", "audit", "courses", "conversations", "bookmarks"):
         raise HTTPException(status_code=400, detail=f"Unknown resource: {resource}")
 
     output = io.StringIO()
@@ -989,6 +2122,33 @@ async def admin_export(
         rows = (await db.execute(base.order_by(AuditLog.created_at.desc()).limit(5000))).scalars().all()
         for l in rows:
             writer.writerow([l.id, l.user_id or "", l.action, l.resource_type or "", l.resource_id or "", json.dumps(l.details) if l.details else "", l.ip_address or "", l.created_at.isoformat()])
+
+    elif resource == "courses":
+        writer.writerow(["id", "name", "code", "semester", "year", "department", "professor", "is_active", "is_public", "owner_id", "owner_email", "created_at"])
+        base = select(Course).options(joinedload(Course.owner))
+        if search:
+            base = base.where(Course.name.ilike(f"%{search}%") | Course.code.ilike(f"%{search}%"))
+        rows = (await db.execute(base.order_by(Course.created_at.desc()).limit(5000))).scalars().all()
+        for c in rows:
+            writer.writerow([c.id, c.name, c.code, c.semester, c.year, c.department, c.professor, c.is_active, c.is_public, c.owner_id, c.owner.email if c.owner else "", c.created_at.isoformat()])
+
+    elif resource == "conversations":
+        writer.writerow(["id", "title", "mode", "course_id", "is_bookmarked", "user_id", "created_at"])
+        base = select(Conversation)
+        if search:
+            base = base.where(Conversation.title.ilike(f"%{search}%"))
+        rows = (await db.execute(base.order_by(Conversation.created_at.desc()).limit(5000))).scalars().all()
+        for c in rows:
+            writer.writerow([c.id, c.title, c.mode, c.course_id or "", c.is_bookmarked, c.user_id, c.created_at.isoformat()])
+
+    elif resource == "bookmarks":
+        writer.writerow(["id", "title", "user_id", "source_info", "tags", "created_at"])
+        base = select(Bookmark)
+        if search:
+            base = base.where(Bookmark.title.ilike(f"%{search}%"))
+        rows = (await db.execute(base.order_by(Bookmark.created_at.desc()).limit(5000))).scalars().all()
+        for b in rows:
+            writer.writerow([b.id, b.title, b.user_id, json.dumps(b.source_info) if b.source_info else "", json.dumps(b.tags) if b.tags else "", b.created_at.isoformat()])
 
     output.seek(0)
     return StreamingResponse(

@@ -30,6 +30,7 @@ class Course(Base):
     # Relationships
     documents: Mapped[list["Document"]] = relationship("Document", back_populates="course")  # noqa: F821
     members: Mapped[list["UserCourse"]] = relationship("UserCourse", back_populates="course")
+    owner: Mapped["User"] = relationship("User")  # noqa: F821
 
 
 class UserCourse(Base):
