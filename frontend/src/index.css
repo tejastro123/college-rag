@@ -1,4 +1,4 @@
-:root {
+:root, [data-theme="dark"] {
   --bg-base:        #0a0a0a;
   --bg-surface:     #111111;
   --bg-elevated:    #1a1a1a;
@@ -31,7 +31,49 @@
   --text-primary:   #fafafa;
   --text-secondary: #a3a3a3;
   --text-muted:     #525252;
+}
 
+[data-theme="light"] {
+  --bg-base:        #f5f5f5;
+  --bg-surface:     #ffffff;
+  --bg-elevated:    #e8e8e8;
+  --bg-card:        #ffffff;
+  --bg-glass:       rgba(255, 255, 255, 0.7);
+
+  --glass-surface:  rgba(255, 255, 255, 0.85);
+  --glass-border:   rgba(0, 0, 0, 0.06);
+  --glass-shadow:   0 8px 32px rgba(0, 0, 0, 0.08);
+
+  --border:         rgba(0, 0, 0, 0.1);
+  --border-bright:  rgba(0, 0, 0, 0.2);
+
+  --accent:         #525252;
+  --accent-light:   #262626;
+  --accent-dark:    #a3a3a3;
+
+  --violet:         #a1a1aa;
+  --cyan:           #71717a;
+  --emerald:        #78716c;
+  --amber:          #78716c;
+  --rose:           #a1a1aa;
+
+  --grad-brand:  linear-gradient(135deg, #737373 0%, #525252 50%, #262626 100%);
+  --grad-card:   linear-gradient(145deg, #ffffff 0%, #f5f5f5 100%);
+  --grad-aurora: linear-gradient(135deg, #d4d4d4 0%, #a3a3a3 30%, #737373 60%, #525252 100%);
+  --grad-mesh:   linear-gradient(135deg, rgba(0,0,0,0.02) 0%, rgba(0,0,0,0.005) 100%);
+  --grad-subtle: linear-gradient(135deg, rgba(0,0,0,0.015) 0%, rgba(255,255,255,0.9) 100%);
+
+  --text-primary:   #171717;
+  --text-secondary: #525252;
+  --text-muted:     #a3a3a3;
+
+  --shadow-sm: 0 2px 8px rgba(0,0,0,0.06);
+  --shadow:    0 4px 24px rgba(0,0,0,0.08);
+  --shadow-lg: 0 8px 48px rgba(0,0,0,0.1);
+  --shadow-glow: 0 0 40px rgba(0, 0, 0, 0.02);
+}
+
+:root {
   --font-sans:    'Inter', system-ui, sans-serif;
   --font-display: 'Outfit', 'Inter', sans-serif;
   --font-mono:    'JetBrains Mono', monospace;
@@ -40,11 +82,6 @@
   --radius:    12px;
   --radius-lg: 16px;
   --radius-xl: 24px;
-
-  --shadow-sm: 0 2px 8px rgba(0,0,0,0.3);
-  --shadow:    0 4px 24px rgba(0,0,0,0.4);
-  --shadow-lg: 0 8px 48px rgba(0,0,0,0.5);
-  --shadow-glow: 0 0 40px rgba(255, 255, 255, 0.03);
 
   --sidebar-w: 72px;
 
@@ -79,10 +116,16 @@ body::before {
   position: fixed;
   inset: 0;
   background:
-    radial-gradient(ellipse at 20% 50%, rgba(255,255,255,0.03) 0%, transparent 50%),
-    radial-gradient(ellipse at 80% 20%, rgba(255,255,255,0.02) 0%, transparent 50%);
+    radial-gradient(ellipse at 20% 50%, rgba(128,128,128,0.05) 0%, transparent 50%),
+    radial-gradient(ellipse at 80% 20%, rgba(128,128,128,0.03) 0%, transparent 50%);
   pointer-events: none;
   z-index: 0;
+}
+
+[data-theme="light"] body::before {
+  background:
+    radial-gradient(ellipse at 20% 50%, rgba(0,0,0,0.02) 0%, transparent 50%),
+    radial-gradient(ellipse at 80% 20%, rgba(0,0,0,0.01) 0%, transparent 50%);
 }
 
 ::-webkit-scrollbar { width: 6px; height: 6px; }

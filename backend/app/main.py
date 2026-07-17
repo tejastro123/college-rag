@@ -10,6 +10,7 @@ from pathlib import Path
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
+from fastapi.middleware.trustedhost import TrustedHostMiddleware
 
 from app.core.config import settings
 from app.core.logging import setup_logging, get_logger
@@ -41,6 +42,14 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning("Vector store warmup failed", error=str(e))
 
+    # Initialize rate limiter
+    try:
+        from app.middleware.rate_limit import init_rate_limiter
+        init_rate_limiter()
+        logger.info("Rate limiter ready")
+    except Exception as e:
+        logger.warning("Rate limiter init skipped", error=str(e))
+
     yield
 
     logger.info("CollegeRAG shutting down")
@@ -66,6 +75,21 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ── Sentry ─────────────────────────────────────────────────
+if settings.SENTRY_DSN:
+    import sentry_sdk
+    sentry_sdk.init(
+        dsn=settings.SENTRY_DSN,
+        environment="production" if not settings.DEBUG else "development",
+        traces_sample_rate=0.1,
+    )
+    logger.info("Sentry initialized")
+
+# ── Rate Limiting ──────────────────────────────────────────
+if settings.RATE_LIMIT_ENABLED:
+    from app.middleware.rate_limit import RateLimitMiddleware
+    app.add_middleware(RateLimitMiddleware)
+
 # ── Routes ─────────────────────────────────────────────────
 app.include_router(api_router, prefix="/api/v1")
 
@@ -78,3 +102,8 @@ async def root():
         "docs": "/docs",
         "status": "running",
     }
+
+
+@app.get("/health")
+async def health():
+    return {"status": "healthy", "version": settings.APP_VERSION}

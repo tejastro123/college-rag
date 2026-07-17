@@ -3,10 +3,18 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 from sqlalchemy.orm import DeclarativeBase
 from app.core.config import settings
 
+# Handle both sqlite and postgres
+connect_args = {}
+if settings.DATABASE_URL.startswith("sqlite"):
+    connect_args["check_same_thread"] = False
+
 engine = create_async_engine(
     settings.DATABASE_URL,
     echo=settings.DEBUG,
-    future=True,
+    connect_args=connect_args,
+    pool_size=20,
+    max_overflow=10,
+    pool_pre_ping=True,
 )
 
 AsyncSessionLocal = async_sessionmaker(
@@ -31,8 +39,7 @@ async def get_db() -> AsyncSession:
 
 
 async def init_db() -> None:
-    """Create all tables."""
-    # Import all models so Base.metadata is populated
-    from app.models import user, document, course, conversation  # noqa: F401
+    """Create all tables (for dev; production uses Alembic)."""
+    from app.models import user, document, course, conversation
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)

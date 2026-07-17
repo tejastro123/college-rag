@@ -2,16 +2,18 @@ import { lazy, Suspense } from 'react'
 import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom'
 import { useAuthStore } from './store'
 import AppLayout from './components/AppLayout'
-
-const ChatLayout = lazy(() => import('./components/ChatLayout'))
 import { ToastProvider } from './components/shared/Toast'
 import { Skeleton } from './components/shared/Skeleton'
 
+const ChatLayout = lazy(() => import('./components/ChatLayout'))
 const LoginPage = lazy(() => import('./pages/LoginPage'))
 const RegisterPage = lazy(() => import('./pages/RegisterPage'))
 const DocumentsPage = lazy(() => import('./pages/DocumentsPage'))
 const CoursesPage = lazy(() => import('./pages/CoursesPage'))
 const StudyToolsPage = lazy(() => import('./pages/StudyToolsPage'))
+const AdminDashboard = lazy(() => import('./pages/AdminDashboard'))
+const OrganizationSettings = lazy(() => import('./pages/OrganizationSettings'))
+const BillingPage = lazy(() => import('./pages/BillingPage'))
 
 function PageFallback() {
   return (
@@ -38,11 +40,14 @@ export default function App() {
             <Route path="/login" element={<LoginPage />} />
             <Route path="/register" element={<RegisterPage />} />
             <Route path="/chat" element={<PrivateRoute><ChatLayout /></PrivateRoute>} />
+            <Route path="/admin" element={<PrivateRoute><AdminDashboard /></PrivateRoute>} />
             <Route path="/" element={<PrivateRoute><AppLayout /></PrivateRoute>}>
               <Route index element={<Navigate to="/chat" replace />} />
               <Route path="documents" element={<DocumentsPage />} />
               <Route path="courses" element={<CoursesPage />} />
               <Route path="study" element={<StudyToolsPage />} />
+              <Route path="org/:orgId" element={<OrganizationSettings />} />
+              <Route path="billing" element={<BillingPage />} />
             </Route>
           </Routes>
         </Suspense>

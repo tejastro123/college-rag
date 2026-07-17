@@ -4,6 +4,8 @@ import { MessageSquare, FileText, BookOpen, Zap, LogOut, ChevronDown, ChevronUp,
 import { useAuthStore, useCourseStore } from '../store'
 import { coursesApi } from '../api'
 import { useIsMobile } from '../hooks/useMediaQuery'
+import SearchBar from './shared/SearchBar'
+import ThemeToggle from './shared/ThemeToggle'
 
 const navItems = [
   { to: '/chat',      icon: MessageSquare, label: 'Chat' },
@@ -123,6 +125,10 @@ export default function AppLayout() {
           )}
         </nav>
 
+        <div style={{ padding: '.5rem' }}>
+          <ThemeToggle />
+        </div>
+
         <div style={{ borderTop: '1px solid rgba(255,255,255,0.06)', padding: '.75rem .5rem', flexShrink: 0 }}>
           <div className="tooltip-wrap" style={{ display: 'flex', justifyContent: 'center', marginBottom: '.5rem' }}>
             <div style={{
@@ -174,6 +180,9 @@ export default function AppLayout() {
       </nav>
 
       <main className="main-content">
+        <div className="hide-mobile" style={{ padding: '.75rem 1.5rem', display: 'flex', justifyContent: 'flex-end' }}>
+          <SearchBar />
+        </div>
         <Outlet />
       </main>
     </div>

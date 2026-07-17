@@ -25,6 +25,7 @@ class Settings(BaseSettings):
     SECRET_KEY: str = "change-me-in-production"
     ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 10080  # 7 days
+    SENTRY_DSN: Optional[str] = None
 
     # ── Database ───────────────────────────────────────────
     DATABASE_URL: str = "sqlite+aiosqlite:///./rag_platform.db"
@@ -32,16 +33,32 @@ class Settings(BaseSettings):
     # ── Vector Store ───────────────────────────────────────
     CHROMA_PERSIST_DIR: str = "./data/chroma"
     CHROMA_COLLECTION_NAME: str = "rag_documents"
+    CHROMA_HOST: Optional[str] = None
+    CHROMA_PORT: Optional[int] = None
 
     # ── File Storage ───────────────────────────────────────
+    STORAGE_BACKEND: str = "local"  # local | s3
     UPLOAD_DIR: str = "./data/uploads"
     MAX_FILE_SIZE_MB: int = 100
+
+    # S3 / MinIO
+    S3_ENDPOINT: Optional[str] = None
+    S3_ACCESS_KEY: Optional[str] = None
+    S3_SECRET_KEY: Optional[str] = None
+    S3_BUCKET_NAME: str = "rag-uploads"
+    S3_REGION: str = "us-east-1"
 
     # ── LLM ────────────────────────────────────────────────
     LLM_PROVIDER: str = "ollama"
     OLLAMA_BASE_URL: str = "http://localhost:11434"
     OLLAMA_MODEL: str = "mistral"
     OLLAMA_EMBEDDING_MODEL: str = "nomic-embed-text"
+    OPENAI_API_KEY: Optional[str] = None
+    OPENAI_MODEL: str = "gpt-4o-mini"
+    GROQ_API_KEY: Optional[str] = None
+    GROQ_MODEL: str = "llama-3.3-70b-versatile"
+    ANTHROPIC_API_KEY: Optional[str] = None
+    ANTHROPIC_MODEL: str = "claude-3-haiku-20240307"
 
     # ── Cohere (reranking) ─────────────────────────────────
     COHERE_API_KEY: Optional[str] = None
@@ -57,6 +74,10 @@ class Settings(BaseSettings):
     RERANK_TOP_K: int = 5
     CHUNK_SIZE: int = 800
     CHUNK_OVERLAP: int = 100
+
+    # ── Rate Limiting ──────────────────────────────────────
+    RATE_LIMIT_ENABLED: bool = True
+    RATE_LIMIT_DEFAULT: str = "60/minute"
 
     # ── CORS ───────────────────────────────────────────────
     ALLOWED_ORIGINS: List[str] = ["http://localhost:5173", "http://localhost:3000"]
@@ -76,11 +97,23 @@ class Settings(BaseSettings):
 
     @property
     def active_llm_model(self) -> str:
+        if self.LLM_PROVIDER == "openai":
+            return self.OPENAI_MODEL
+        elif self.LLM_PROVIDER == "groq":
+            return self.GROQ_MODEL
+        elif self.LLM_PROVIDER == "anthropic":
+            return self.ANTHROPIC_MODEL
         return self.OLLAMA_MODEL
 
     @property
     def active_llm_key(self) -> Optional[str]:
-        return "local"
+        if self.LLM_PROVIDER == "openai":
+            return self.OPENAI_API_KEY
+        elif self.LLM_PROVIDER == "groq":
+            return self.GROQ_API_KEY
+        elif self.LLM_PROVIDER == "anthropic":
+            return self.ANTHROPIC_API_KEY
+        return None
 
 
 settings = Settings()
