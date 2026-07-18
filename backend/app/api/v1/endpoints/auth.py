@@ -72,6 +72,15 @@ async def register(data: RegisterRequest, db: AsyncSession = Depends(get_db)):
     await db.refresh(user)
 
     token = create_access_token({"sub": user.id})
+    from app.services.event_bus import trigger_webhooks
+    import asyncio
+    asyncio.create_task(trigger_webhooks("user.created", {
+        "id": user.id,
+        "email": user.email,
+        "username": user.username,
+        "full_name": user.full_name,
+        "role": user.role
+    }))
     return TokenResponse(
         access_token=token,
         user={"id": user.id, "email": user.email, "username": user.username,

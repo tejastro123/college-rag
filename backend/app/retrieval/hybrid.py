@@ -18,6 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import settings
 from app.core.logging import get_logger
 from app.embeddings.vector_store import get_vector_store
+from app.services.search_tuning import get_search_tuning_settings
 from .bm25_index import get_bm25_index
 from .query_expansion import expand_query
 from .hyde import generate_hypothetical_document, HYDE_INTENTS
@@ -103,7 +104,27 @@ async def retrieve(
     top_k: int = None,
     rerank: bool = True,
 ) -> list[RetrievedChunk]:
-    top_k = top_k or settings.RETRIEVAL_TOP_K
+    # ── 0. Load Dynamic Settings ────────────────────────────
+    try:
+        tuning = await get_search_tuning_settings(db)
+    except Exception as e:
+        logger.warning("Failed to load search tuning settings, using defaults", error=str(e))
+        tuning = {
+            "hybrid_alpha": 0.5,
+            "query_expansion_enabled": settings.QUERY_EXPANSION_ENABLED,
+            "hyde_enabled": settings.HYDE_ENABLED,
+            "rerank_enabled": True,
+            "rerank_top_k": settings.RERANK_TOP_K,
+            "retrieval_top_k": settings.RETRIEVAL_TOP_K,
+        }
+
+    alpha = tuning["hybrid_alpha"]
+    q_expansion = tuning["query_expansion_enabled"]
+    hyde_enabled = tuning["hyde_enabled"]
+    rerank_enabled = tuning["rerank_enabled"]
+    rerank_top_k = tuning["rerank_top_k"]
+    top_k = top_k or tuning["retrieval_top_k"]
+
     intent = _query_intent(query)
     where_filter = _build_where_filter(course_id, document_ids, doc_type_filter)
 
@@ -111,9 +132,9 @@ async def retrieve(
     query_variants = [query]
 
     expansion_tasks = []
-    if settings.QUERY_EXPANSION_ENABLED:
+    if q_expansion:
         expansion_tasks.append(expand_query(query))
-    if settings.HYDE_ENABLED and intent in HYDE_INTENTS:
+    if hyde_enabled and intent in HYDE_INTENTS:
         expansion_tasks.append(generate_hypothetical_document(query, intent))
 
     if expansion_tasks:
@@ -188,7 +209,7 @@ async def retrieve(
         if not variant_map:
             continue
 
-        # RRF merge within this variant
+        # RRF merge within this variant (weighted by alpha)
         vec_ids = [r["id"] for r in vec_results]
         bm25_ids = [r["id"] for r in bm25_results]
 
@@ -196,9 +217,9 @@ async def retrieve(
         for cid, data in variant_map.items():
             rrf = 0.0
             if cid in vec_ids:
-                rrf += _rrf_score(vec_ids.index(cid) + 1)
+                rrf += alpha * _rrf_score(vec_ids.index(cid) + 1)
             if cid in bm25_ids:
-                rrf += _rrf_score(bm25_ids.index(cid) + 1)
+                rrf += (1.0 - alpha) * _rrf_score(bm25_ids.index(cid) + 1)
             scored.append((cid, rrf))
 
         scored.sort(key=lambda x: x[1], reverse=True)
@@ -239,7 +260,7 @@ async def retrieve(
     candidates = sorted(all_candidates.values(), key=lambda c: c.score, reverse=True)
 
     # ── 4. Reranking (Cohere → local cross-encoder fallback) ──
-    if rerank:
+    if rerank and rerank_enabled:
         reranked = None
 
         if settings.COHERE_API_KEY:
@@ -250,7 +271,7 @@ async def retrieve(
                 rerank_result = co.rerank(
                     query=query,
                     documents=docs_for_rerank,
-                    top_n=settings.RERANK_TOP_K,
+                    top_n=rerank_top_k,
                     model="rerank-multilingual-v3.0",
                 )
                 reranked = []
@@ -264,7 +285,7 @@ async def retrieve(
                 logger.warning("Cohere reranking failed, trying local", error=str(e))
 
         if reranked is None and settings.RERANK_PROVIDER != "cohere":
-            local = await run_local_rerank(query, candidates, settings.RERANK_TOP_K)
+            local = await run_local_rerank(query, candidates, rerank_top_k)
             if local:
                 candidates = local
 
@@ -276,7 +297,7 @@ async def retrieve(
         if fingerprint not in seen_content:
             seen_content.add(fingerprint)
             final.append(c)
-        if len(final) >= settings.RERANK_TOP_K:
+        if len(final) >= rerank_top_k:
             break
 
     logger.info(

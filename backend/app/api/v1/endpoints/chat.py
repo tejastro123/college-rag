@@ -91,6 +91,13 @@ async def chat(
     db.add(user_msg)
     await db.flush()
 
+    # Log search query
+    try:
+        from app.services.search_tuning import log_search_query
+        await log_search_query(db, request.message, user_id=current_user.id, session_id=conv.id, log_id=user_msg.id)
+    except Exception as e:
+        logger.warning("Failed to log search query to analytics", error=str(e))
+
     # ── Run RAG ───────────────────────────────────────────────
     try:
         rag_result = await run_rag(
@@ -186,6 +193,14 @@ async def chat_stream(
     )
     db.add(user_msg)
     await db.flush()
+
+    # Log search query
+    try:
+        from app.services.search_tuning import log_search_query
+        await log_search_query(db, request.message, user_id=current_user.id, session_id=conv.id, log_id=user_msg.id)
+    except Exception as e:
+        logger.warning("Failed to log search query to analytics", error=str(e))
+
     await db.commit()
 
     citations_accumulated = []

@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Optional
 
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import select, delete
 
 from app.core.config import settings
 from app.core.logging import get_logger
@@ -30,6 +30,23 @@ def _compute_checksum(file_path: Path) -> str:
         for block in iter(lambda: f.read(65536), b""):
             sha.update(block)
     return sha.hexdigest()
+
+
+async def append_pipeline_log(document_id: str, stage: str, message: str, level: str = "info"):
+    from app.services.cache import cache_get, cache_set
+    try:
+        key = f"pipeline_logs:{document_id}"
+        logs = await cache_get(key) or []
+        entry = {
+            "timestamp": datetime.utcnow().isoformat(),
+            "stage": stage,
+            "message": message,
+            "level": level
+        }
+        logs.append(entry)
+        await cache_set(key, logs, ttl=604800)  # keep for 7 days
+    except Exception as e:
+        logger.warning("Failed to write pipeline log to cache", doc_id=document_id, error=str(e))
 
 
 async def ingest_document(
@@ -56,18 +73,50 @@ async def ingest_document(
         if not doc:
             raise ValueError(f"Document {document_id} not found")
 
-        # Mark as processing
-        doc.status = "processing"
+        await append_pipeline_log(document_id, "upload", f"Ingestion triggered for file {doc.original_filename} ({doc.file_type})", "info")
+
+        # Mark as processing:parsing
+        doc.status = "processing:parsing"
+        await db.commit()
+
+        # Clear old chunks from vector store and SQLite database to avoid duplication
+        try:
+            await append_pipeline_log(document_id, "upload", "Cleaning up previously indexed chunks and vector embeddings...", "info")
+            vector_store = await get_vector_store()
+            await vector_store.delete_document(document_id)
+        except Exception as e:
+            logger.warning("Failed to clear vector store before ingestion", error=str(e))
+        
+        await db.execute(delete(Chunk).where(Chunk.document_id == document_id))
         await db.commit()
 
         path = Path(file_path)
         logger.info("Starting ingestion", doc_id=document_id, filename=doc.original_filename)
 
+        # Emit parsing started event
+        try:
+            from app.services.event_bus import emit_ingestion_event
+            await emit_ingestion_event(doc.id, doc.original_filename, "processing:parsing", course_id=doc.course_id)
+        except Exception:
+            pass
+
         # ── 1. Parse ───────────────────────────────────────────
+        await append_pipeline_log(document_id, "parse", "Initializing parser. Extracting text content, pages, and metadata structure...", "info")
         parsed = await asyncio.to_thread(parse_document, path)
         total_pages = len(parsed.pages)
+        await append_pipeline_log(document_id, "parse", f"Parsed {total_pages} page(s). OCR processed: {parsed.metadata.get('ocr', False)}", "info")
+
+        # Mark as processing:chunking
+        doc.status = "processing:chunking"
+        await db.commit()
+        try:
+            from app.services.event_bus import emit_ingestion_event
+            await emit_ingestion_event(doc.id, doc.original_filename, "processing:chunking", course_id=doc.course_id)
+        except Exception:
+            pass
 
         # ── 2. Chunk ───────────────────────────────────────────
+        await append_pipeline_log(document_id, "chunk", "Starting hierarchical layout-aware semantic chunking...", "info")
         doc_metadata = {
             "document_id": document_id,
             "filename": doc.original_filename,
@@ -79,14 +128,31 @@ async def ingest_document(
             "author": doc.author or parsed.metadata.get("author", ""),
         }
         chunks = await asyncio.to_thread(chunk_document, parsed.pages, doc_metadata=doc_metadata)
+        await append_pipeline_log(document_id, "chunk", f"Successfully generated {len(chunks)} chunks from document text.", "info")
 
         if not chunks:
             doc.status = "failed"
             doc.error_message = "No content extracted from document"
             await db.commit()
+            await append_pipeline_log(document_id, "failed", "Ingestion failed: No text content could be extracted.", "error")
+            try:
+                from app.services.event_bus import emit_ingestion_event
+                await emit_ingestion_event(doc.id, doc.original_filename, "failed", error="No content extracted", course_id=doc.course_id)
+            except Exception:
+                pass
             return {"success": False, "error": "No content extracted"}
 
+        # Mark as processing:embedding
+        doc.status = "processing:embedding"
+        await db.commit()
+        try:
+            from app.services.event_bus import emit_ingestion_event
+            await emit_ingestion_event(doc.id, doc.original_filename, "processing:embedding", course_id=doc.course_id)
+        except Exception:
+            pass
+
         # ── 3. Save chunks to DB ───────────────────────────────
+        await append_pipeline_log(document_id, "chunk", f"Writing {len(chunks)} chunk records to SQLite database...", "info")
         chunk_records = []
         for chunk in chunks:
             record = Chunk(
@@ -108,6 +174,7 @@ async def ingest_document(
         await db.flush()
 
         # ── 4. Embed & index ───────────────────────────────────
+        await append_pipeline_log(document_id, "embed", "Generating vector embeddings and indexing into ChromaDB...", "info")
         vector_store = await get_vector_store()
         chunk_texts = [c.content for c in chunks]
         chunk_ids = [r.id for r in chunk_records]
@@ -129,17 +196,30 @@ async def ingest_document(
             })
 
         await vector_store.add_documents(chunk_texts, chunk_ids, chunk_metas)
+        await append_pipeline_log(document_id, "embed", f"Vector index populated with {len(chunks)} embeddings.", "info")
 
         # Update vector_id on chunks
         for record, vid in zip(chunk_records, chunk_ids):
             record.vector_id = vid
 
+        # Mark as processing:indexing
+        doc.status = "processing:indexing"
+        await db.commit()
+        try:
+            from app.services.event_bus import emit_ingestion_event
+            await emit_ingestion_event(doc.id, doc.original_filename, "processing:indexing", course_id=doc.course_id)
+        except Exception:
+            pass
+
         # Rebuild BM25 index with new chunks
+        await append_pipeline_log(document_id, "index", "Rebuilding BM25 lexical search index...", "info")
         try:
             from app.retrieval.bm25_index import rebuild_index_from_db
             await rebuild_index_from_db(db)
+            await append_pipeline_log(document_id, "index", "BM25 lexical index successfully updated.", "info")
         except Exception as e:
             logger.warning("BM25 index rebuild failed", error=str(e))
+            await append_pipeline_log(document_id, "index", f"BM25 lexical index rebuild failed: {str(e)}", "warning")
 
         # Invalidate semantic cache for this course
         try:
@@ -161,14 +241,36 @@ async def ingest_document(
 
         await db.commit()
         logger.info("Ingestion complete", doc_id=document_id, chunks=len(chunks))
+        await append_pipeline_log(document_id, "index", "Ingestion completed successfully. Document is ready for usage.", "success")
+
+        # Emit success event
+        try:
+            from app.services.event_bus import emit_ingestion_event, check_and_emit_alerts
+            await emit_ingestion_event(
+                doc.id, doc.original_filename, "indexed",
+                chunks=len(chunks), course_id=doc.course_id,
+            )
+        except Exception:
+            pass
+
         return {"success": True, "chunks": len(chunks), "pages": total_pages}
 
     except Exception as e:
         logger.error("Ingestion failed", doc_id=document_id, error=str(e))
+        await append_pipeline_log(document_id, "failed", f"Ingestion pipeline failed: {str(e)}", "error")
         if doc:
             doc.status = "failed"
             doc.error_message = str(e)
             await db.commit()
+            # Emit failure event
+            try:
+                from app.services.event_bus import emit_ingestion_event
+                await emit_ingestion_event(
+                    doc.id, doc.original_filename, "failed",
+                    error=str(e)[:200], course_id=doc.course_id,
+                )
+            except Exception:
+                pass
         raise
     finally:
         if close_db:

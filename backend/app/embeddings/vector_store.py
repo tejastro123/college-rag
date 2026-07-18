@@ -89,6 +89,21 @@ class VectorStore:
             logger.error("Failed to get all IDs", error=str(e))
             return []
 
+    async def get_embeddings_by_ids(self, ids: list[str]) -> list[list[float]]:
+        if not ids:
+            return []
+        try:
+            results = await asyncio.to_thread(
+                self._collection.get, ids=ids, include=["embeddings"]
+            )
+            embeddings = results.get("embeddings")
+            if embeddings is None:
+                return []
+            return list(embeddings)
+        except Exception as e:
+            logger.error("Failed to get embeddings by IDs", error=str(e))
+            return []
+
     async def clear_all(self) -> None:
         ids = await self.get_all_ids()
         if ids:

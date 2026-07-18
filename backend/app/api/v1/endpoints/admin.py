@@ -7,20 +7,22 @@ import json
 from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Optional
+from pydantic import BaseModel
 
-from fastapi import APIRouter, Depends, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Depends, HTTPException, Query, WebSocket, WebSocketDisconnect, BackgroundTasks
 from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, delete, case, text, Integer
 from sqlalchemy.orm import joinedload, selectinload
 
-from app.db.database import get_db
+from app.db.database import get_db, AsyncSessionLocal
 from app.models.user import User
 from app.models.document import Document, Chunk
 from app.models.conversation import Message, Conversation
 from app.models.billing import UsageRecord, Subscription
 from app.models.organization import Organization, OrganizationMember
 from app.models.audit import AuditLog
+from app.models.security import APIKey, WebhookSubscription
 from app.models.course import Course, UserCourse
 from app.models.conversation import Bookmark
 from app.auth.security import get_current_user, decode_token
@@ -51,7 +53,6 @@ class AdminWSManager:
         self._connections: list[WebSocket] = []
 
     async def connect(self, ws: WebSocket):
-        await ws.accept()
         self._connections.append(ws)
 
     def disconnect(self, ws: WebSocket):
@@ -75,6 +76,113 @@ async def require_admin(current_user: User = Depends(get_current_user)) -> User:
     if current_user.role != "admin":
         raise HTTPException(status_code=403, detail="Admin access required")
     return current_user
+
+
+async def write_audit_log(
+    db: AsyncSession,
+    action: str,
+    resource_type: str | None = None,
+    resource_id: str | None = None,
+    user_id: str | None = None,
+    details: dict | None = None,
+    ip_address: str | None = None,
+) -> AuditLog:
+    """Write an audit log entry and broadcast it via WS."""
+    entry = AuditLog(
+        action=action,
+        resource_type=resource_type,
+        resource_id=resource_id,
+        user_id=user_id,
+        details=details,
+        ip_address=ip_address,
+    )
+    db.add(entry)
+    await db.flush()  # get ID before commit
+
+    # Fire-and-forget WS broadcast
+    try:
+        from app.services.event_bus import emit_audit_event
+        import asyncio
+        asyncio.create_task(emit_audit_event(
+            action=action,
+            resource_type=resource_type,
+            resource_id=resource_id,
+            user_id=user_id,
+            details=details,
+            ip_address=ip_address,
+        ))
+    except Exception:
+        pass
+
+    return entry
+
+
+# ── Alerts ─────────────────────────────────────────────────
+
+@router.get("/alerts")
+async def admin_alerts(
+    db: AsyncSession = Depends(get_db),
+    admin: User = Depends(require_admin),
+):
+    """Return current alert conditions based on live stats snapshot."""
+    from app.services.event_bus import ALERT_THRESHOLDS
+
+    now = datetime.utcnow()
+    week_ago = now.date() - timedelta(days=7)
+
+    failed_docs = (await db.execute(
+        select(func.count(Document.id)).where(Document.status == "failed")
+    )).scalar() or 0
+    total_docs = (await db.execute(select(func.count(Document.id)))).scalar() or 0
+    storage_bytes = (await db.execute(select(func.sum(Document.file_size)))).scalar() or 0
+
+    latency_rows = (await db.execute(
+        select(Message.latency_ms)
+        .where(Message.latency_ms.isnot(None))
+        .order_by(Message.latency_ms)
+    )).scalars().all()
+    lat_count = len(latency_rows)
+    latency_p95 = latency_rows[int(lat_count * 0.95)] if lat_count > 0 else None
+
+    stats = {
+        "failed_ingestions": failed_docs,
+        "documents": total_docs,
+        "storage_bytes": storage_bytes,
+        "latency_p95": latency_p95,
+    }
+
+    alerts = []
+    if total_docs > 0:
+        error_pct = (failed_docs / total_docs) * 100
+        if error_pct >= ALERT_THRESHOLDS["error_spike_pct"]:
+            alerts.append({
+                "level": "error",
+                "type": "ingestion_error_spike",
+                "message": f"Ingestion failure rate {error_pct:.1f}% ({failed_docs}/{total_docs} docs)",
+                "value": error_pct,
+                "threshold": ALERT_THRESHOLDS["error_spike_pct"],
+            })
+
+    storage_gb = storage_bytes / (1024 ** 3)
+    if storage_gb >= ALERT_THRESHOLDS["storage_threshold_gb"]:
+        alerts.append({
+            "level": "warning",
+            "type": "storage_threshold",
+            "message": f"Storage {storage_gb:.2f} GB exceeds {ALERT_THRESHOLDS['storage_threshold_gb']} GB threshold",
+            "value": storage_gb,
+            "threshold": ALERT_THRESHOLDS["storage_threshold_gb"],
+        })
+
+    if latency_p95 and latency_p95 >= ALERT_THRESHOLDS["latency_p95_ms"]:
+        alerts.append({
+            "level": "warning",
+            "type": "high_latency",
+            "message": f"P95 latency {latency_p95:.0f}ms exceeds {ALERT_THRESHOLDS['latency_p95_ms']:.0f}ms threshold",
+            "value": latency_p95,
+            "threshold": ALERT_THRESHOLDS["latency_p95_ms"],
+        })
+
+    return {"alerts": alerts, "thresholds": ALERT_THRESHOLDS, "checked_at": now.isoformat() + "Z"}
 
 
 # ── Stats ──────────────────────────────────────────────────
@@ -656,6 +764,14 @@ async def update_user(
     if full_name is not None:
         user.full_name = full_name
 
+    await write_audit_log(
+        db=db,
+        action="update_user",
+        resource_type="user",
+        resource_id=user_id,
+        user_id=admin.id,
+        details={"role": role, "is_active": is_active, "full_name": full_name}
+    )
     await db.commit()
     return {"status": "updated", "user_id": user_id}
 
@@ -674,6 +790,13 @@ async def delete_user(
         raise HTTPException(status_code=400, detail="Cannot delete admin users")
 
     await db.delete(user)
+    await write_audit_log(
+        db=db,
+        action="delete_user",
+        resource_type="user",
+        resource_id=user_id,
+        user_id=admin.id
+    )
     await db.commit()
     return {"status": "deleted"}
 
@@ -695,8 +818,12 @@ async def admin_documents(
     count_base = select(func.count(Document.id))
 
     if status_filter:
-        base = base.where(Document.status == status_filter)
-        count_base = count_base.where(Document.status == status_filter)
+        if status_filter == "processing":
+            base = base.where(Document.status.like("processing%"))
+            count_base = count_base.where(Document.status.like("processing%"))
+        else:
+            base = base.where(Document.status == status_filter)
+            count_base = count_base.where(Document.status == status_filter)
 
     if search:
         pattern = f"%{search}%"
@@ -812,6 +939,239 @@ async def admin_document_detail(
         "created_at": doc.created_at.isoformat(),
         "updated_at": doc.updated_at.isoformat(),
         "indexed_at": doc.indexed_at.isoformat() if doc.indexed_at else None,
+    }
+
+
+# ── Admin Document Pipeline Management ───────────────────
+
+@router.post("/documents/{doc_id}/reprocess", status_code=202)
+async def admin_reprocess_document(
+    doc_id: str,
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db),
+    admin: User = Depends(require_admin),
+):
+    """Admin endpoint to retry/reprocess any document, bypassing ownership checks."""
+    result = await db.execute(select(Document).where(Document.id == doc_id))
+    doc = result.scalar_one_or_none()
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    doc.status = "pending"
+    doc.error_message = None
+    await write_audit_log(
+        db=db,
+        action="reprocess_document",
+        resource_type="document",
+        resource_id=doc_id,
+        user_id=admin.id,
+        details={"filename": doc.original_filename}
+    )
+    await db.commit()
+    from app.ingestion.pipeline import ingest_document
+    background_tasks.add_task(ingest_document, doc.id, doc.file_path)
+    return {"message": "Reprocessing started", "document_id": doc_id}
+
+
+class BatchReprocessRequest(BaseModel):
+    document_ids: list[str]
+
+@router.post("/documents/batch-reprocess", status_code=202)
+async def admin_batch_reprocess_documents(
+    req: BatchReprocessRequest,
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db),
+    admin: User = Depends(require_admin),
+):
+    """Admin endpoint to batch reprocess multiple documents at once."""
+    if not req.document_ids:
+        raise HTTPException(status_code=400, detail="document_ids is required")
+
+    result = await db.execute(select(Document).where(Document.id.in_(req.document_ids)))
+    docs = result.scalars().all()
+    
+    triggered_ids = []
+    for doc in docs:
+        doc.status = "pending"
+        doc.error_message = None
+        triggered_ids.append(doc.id)
+        from app.ingestion.pipeline import ingest_document
+        background_tasks.add_task(ingest_document, doc.id, doc.file_path)
+
+    if triggered_ids:
+        await write_audit_log(
+            db=db,
+            action="batch_reprocess_documents",
+            resource_type="document",
+            user_id=admin.id,
+            details={"count": len(triggered_ids), "document_ids": triggered_ids}
+        )
+        await db.commit()
+
+    return {"message": f"Reprocessing triggered for {len(triggered_ids)} documents", "document_ids": triggered_ids}
+
+
+@router.get("/documents/{doc_id}/failed-chunks")
+async def admin_failed_chunks(
+    doc_id: str,
+    db: AsyncSession = Depends(get_db),
+    admin: User = Depends(require_admin),
+):
+    """Admin endpoint to inspect chunks that have potential issues or failed indexing."""
+    result = await db.execute(select(Document).where(Document.id == doc_id))
+    doc = result.scalar_one_or_none()
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    chunk_result = await db.execute(
+        select(Chunk)
+        .where(Chunk.document_id == doc_id)
+        .order_by(Chunk.chunk_index)
+    )
+    chunks = chunk_result.scalars().all()
+
+    failed_chunks = []
+    for c in chunks:
+        is_failed = False
+        reasons = []
+        
+        if doc.status == "indexed" and not c.vector_id:
+            is_failed = True
+            reasons.append("Missing vector_id in vector store")
+            
+        if not c.content or len(c.content.strip()) == 0:
+            is_failed = True
+            reasons.append("Chunk content is empty")
+            
+        if c.token_count == 0:
+            is_failed = True
+            reasons.append("Token count is 0")
+            
+        if is_failed:
+            failed_chunks.append({
+                "id": c.id,
+                "chunk_index": c.chunk_index,
+                "content_preview": (c.content or "")[:300],
+                "page_number": c.page_number,
+                "chunk_type": c.chunk_type,
+                "token_count": c.token_count,
+                "char_count": c.char_count,
+                "reasons": reasons,
+            })
+
+    return {
+        "document_id": doc_id,
+        "filename": doc.original_filename,
+        "status": doc.status,
+        "total_chunks": len(chunks),
+        "failed_chunks": failed_chunks,
+        "failed_count": len(failed_chunks),
+    }
+
+
+@router.get("/documents/{doc_id}/logs")
+async def admin_document_logs(
+    doc_id: str,
+    db: AsyncSession = Depends(get_db),
+    admin: User = Depends(require_admin),
+):
+    """Fetch live pipeline execution logs for a document."""
+    from app.services.cache import cache_get
+    key = f"pipeline_logs:{doc_id}"
+    logs = await cache_get(key)
+    return {"document_id": doc_id, "logs": logs or []}
+
+
+class UpdateChunkRequest(BaseModel):
+    content: str
+    page_number: Optional[int] = None
+    chunk_type: Optional[str] = None
+
+
+@router.put("/chunks/{chunk_id}")
+async def admin_update_chunk(
+    chunk_id: str,
+    req: UpdateChunkRequest,
+    db: AsyncSession = Depends(get_db),
+    admin: User = Depends(require_admin),
+):
+    """Admin endpoint to manually edit/repair a chunk's content and re-index it."""
+    result = await db.execute(select(Chunk).where(Chunk.id == chunk_id))
+    chunk = result.scalar_one_or_none()
+    if not chunk:
+        raise HTTPException(status_code=404, detail="Chunk not found")
+
+    doc_result = await db.execute(select(Document).where(Document.id == chunk.document_id))
+    doc = doc_result.scalar_one_or_none()
+    if not doc:
+        raise HTTPException(status_code=404, detail="Parent document not found")
+
+    chunk.content = req.content
+    if req.page_number is not None:
+        chunk.page_number = req.page_number
+    if req.chunk_type is not None:
+        chunk.chunk_type = req.chunk_type
+    
+    chunk.char_count = len(req.content)
+    chunk.token_count = max(1, len(req.content) // 4)
+    
+    await db.commit()
+
+    # Re-embed and update vector store
+    try:
+        from app.embeddings.vector_store import get_vector_store
+        vector_store = await get_vector_store()
+        
+        meta = {
+            "document_id": chunk.document_id,
+            "chunk_id": chunk.id,
+            "filename": doc.original_filename,
+            "chunk_type": chunk.chunk_type,
+            "page_number": chunk.page_number or 0,
+            "course_id": doc.course_id or "",
+            "subject": doc.subject or "",
+            "semester": doc.semester or "",
+            "unit": doc.unit or "",
+            "doc_type": doc.doc_type or "",
+        }
+        
+        await vector_store.add_documents(
+            texts=[chunk.content],
+            ids=[chunk.id],
+            metadatas=[meta]
+        )
+    except Exception as e:
+        logger.error("Failed to update vector store for chunk", chunk_id=chunk_id, error=str(e))
+        raise HTTPException(status_code=500, detail=f"Failed to update vector store: {str(e)}")
+
+    chunk.vector_id = chunk.id
+    await db.commit()
+
+    # Rebuild BM25 index
+    try:
+        from app.retrieval.bm25_index import rebuild_index_from_db
+        await rebuild_index_from_db(db)
+    except Exception as e:
+        logger.warning("BM25 index rebuild failed after chunk edit", error=str(e))
+
+    await write_audit_log(
+        db=db,
+        action="update_chunk",
+        resource_type="chunk",
+        resource_id=chunk_id,
+        user_id=admin.id,
+        details={"document_id": chunk.document_id, "chunk_index": chunk.chunk_index}
+    )
+    await db.commit()
+
+    return {
+        "ok": True,
+        "chunk": {
+            "id": chunk.id,
+            "content": chunk.content,
+            "token_count": chunk.token_count,
+            "char_count": chunk.char_count
+        }
     }
 
 
@@ -2057,6 +2417,14 @@ async def admin_users_batch(
 
     await db.commit()
 
+    await write_audit_log(
+        db=db,
+        action=f"batch_{action}_users",
+        resource_type="user",
+        user_id=admin.id,
+        details={"count": results["succeeded"], "action": action, "user_ids": user_ids}
+    )
+
     await admin_ws_manager.broadcast("users:updated", {
         "action": action,
         "count": results["succeeded"],
@@ -2158,6 +2526,411 @@ async def admin_export(
     )
 
 
+# ── Security & Access Management ───────────────────────────
+
+@router.post("/users/{user_id}/impersonate")
+async def admin_impersonate_user(
+    user_id: str,
+    db: AsyncSession = Depends(get_db),
+    admin: User = Depends(require_admin),
+):
+    """Admin endpoint to login/impersonate another user. Returns access token."""
+    result = await db.execute(select(User).where(User.id == user_id))
+    user = result.scalar_one_or_none()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    if user.role == "admin":
+        raise HTTPException(status_code=400, detail="Cannot impersonate admin users")
+
+    # Generate token for this user
+    from app.auth.security import create_access_token
+    token = create_access_token({"sub": user.id})
+
+    # Log audit event
+    await write_audit_log(
+        db=db,
+        action="impersonate_user",
+        resource_type="user",
+        resource_id=user_id,
+        user_id=admin.id,
+        details={"impersonated_email": user.email}
+    )
+    await db.commit()
+
+    return {
+        "access_token": token,
+        "token_type": "bearer",
+        "user": {
+            "id": user.id,
+            "email": user.email,
+            "username": user.username,
+            "full_name": user.full_name,
+            "role": user.role
+        }
+    }
+
+
+@router.get("/organizations/{org_id}/feature-flags")
+async def get_org_feature_flags(
+    org_id: str,
+    db: AsyncSession = Depends(get_db),
+    admin: User = Depends(require_admin),
+):
+    """Fetch feature flags for an organization."""
+    result = await db.execute(select(Organization).where(Organization.id == org_id))
+    org = result.scalar_one_or_none()
+    if not org:
+        raise HTTPException(status_code=404, detail="Organization not found")
+    
+    settings_dict = org.settings or {}
+    flags = settings_dict.get("feature_flags", {
+        "enable_ocr": True,
+        "enable_web_search": True,
+        "custom_models": False,
+        "voice_chat": False,
+        "sandbox_mode": False
+    })
+    return {"organization_id": org_id, "feature_flags": flags}
+
+
+class UpdateFeatureFlagsRequest(BaseModel):
+    feature_flags: dict
+
+
+@router.put("/organizations/{org_id}/feature-flags")
+async def update_org_feature_flags(
+    org_id: str,
+    req: UpdateFeatureFlagsRequest,
+    db: AsyncSession = Depends(get_db),
+    admin: User = Depends(require_admin),
+):
+    """Update feature flags for an organization."""
+    result = await db.execute(select(Organization).where(Organization.id == org_id))
+    org = result.scalar_one_or_none()
+    if not org:
+        raise HTTPException(status_code=404, detail="Organization not found")
+    
+    org_settings = org.settings or {}
+    org_settings["feature_flags"] = req.feature_flags
+    org.settings = org_settings
+    
+    from sqlalchemy.orm.attributes import flag_modified
+    flag_modified(org, "settings")
+    await db.commit()
+    
+    await write_audit_log(
+        db=db,
+        action="update_feature_flags",
+        resource_type="organization",
+        resource_id=org_id,
+        user_id=admin.id,
+        details={"feature_flags": req.feature_flags}
+    )
+    await db.commit()
+    
+    return {"ok": True, "feature_flags": org.settings["feature_flags"]}
+
+
+@router.get("/api-keys")
+async def get_all_api_keys(
+    db: AsyncSession = Depends(get_db),
+    admin: User = Depends(require_admin),
+):
+    """List all API keys."""
+    result = await db.execute(select(APIKey))
+    keys = result.scalars().all()
+    return [
+        {
+            "id": k.id,
+            "name": k.name,
+            "key_prefix": k.key_prefix,
+            "owner_id": k.owner_id,
+            "organization_id": k.organization_id,
+            "is_active": k.is_active,
+            "created_at": k.created_at.isoformat() if k.created_at else None,
+            "expires_at": k.expires_at.isoformat() if k.expires_at else None,
+            "last_used_at": k.last_used_at.isoformat() if k.last_used_at else None
+        }
+        for k in keys
+    ]
+
+
+class CreateAPIKeyRequest(BaseModel):
+    name: str
+    organization_id: Optional[str] = None
+    owner_id: str
+
+
+@router.post("/api-keys")
+async def create_api_key(
+    req: CreateAPIKeyRequest,
+    db: AsyncSession = Depends(get_db),
+    admin: User = Depends(require_admin),
+):
+    """Create a new API Key for access."""
+    import secrets
+    import hashlib
+    raw_key = f"cr_live_{secrets.token_hex(20)}"
+    hashed = hashlib.sha256(raw_key.encode()).hexdigest()
+    
+    new_key = APIKey(
+        name=req.name,
+        key_prefix=raw_key[:12],
+        hashed_key=hashed,
+        owner_id=req.owner_id,
+        organization_id=req.organization_id,
+        is_active=True
+    )
+    db.add(new_key)
+    await db.commit()
+    
+    await write_audit_log(
+        db=db,
+        action="create_api_key",
+        resource_type="api_key",
+        resource_id=new_key.id,
+        user_id=admin.id,
+        details={"name": req.name, "organization_id": req.organization_id}
+    )
+    await db.commit()
+    
+    return {
+        "id": new_key.id,
+        "name": new_key.name,
+        "key_prefix": new_key.key_prefix,
+        "raw_key": raw_key,
+        "created_at": new_key.created_at.isoformat() if new_key.created_at else None
+    }
+
+
+@router.put("/api-keys/{key_id}/toggle")
+async def toggle_api_key(
+    key_id: str,
+    db: AsyncSession = Depends(get_db),
+    admin: User = Depends(require_admin),
+):
+    """Toggle API Key active state."""
+    result = await db.execute(select(APIKey).where(APIKey.id == key_id))
+    key = result.scalar_one_or_none()
+    if not key:
+        raise HTTPException(status_code=404, detail="API Key not found")
+    
+    key.is_active = not key.is_active
+    await db.commit()
+    
+    await write_audit_log(
+        db=db,
+        action="toggle_api_key",
+        resource_type="api_key",
+        resource_id=key_id,
+        user_id=admin.id,
+        details={"is_active": key.is_active}
+    )
+    await db.commit()
+    
+    return {"ok": True, "is_active": key.is_active}
+
+
+@router.delete("/api-keys/{key_id}")
+async def delete_api_key(
+    key_id: str,
+    db: AsyncSession = Depends(get_db),
+    admin: User = Depends(require_admin),
+):
+    """Revoke/Delete an API key."""
+    result = await db.execute(select(APIKey).where(APIKey.id == key_id))
+    key = result.scalar_one_or_none()
+    if not key:
+        raise HTTPException(status_code=404, detail="API Key not found")
+    
+    await db.delete(key)
+    await db.commit()
+    
+    await write_audit_log(
+        db=db,
+        action="delete_api_key",
+        resource_type="api_key",
+        resource_id=key_id,
+        user_id=admin.id,
+        details={"name": key.name}
+    )
+    await db.commit()
+    return {"ok": True}
+
+
+@router.get("/webhook-subscriptions")
+async def list_webhook_subscriptions(
+    db: AsyncSession = Depends(get_db),
+    admin: User = Depends(require_admin),
+):
+    """List all webhook subscriptions."""
+    result = await db.execute(select(WebhookSubscription))
+    subs = result.scalars().all()
+    return [
+        {
+            "id": s.id,
+            "url": s.url,
+            "event_types": s.event_types,
+            "organization_id": s.organization_id,
+            "is_active": s.is_active,
+            "created_at": s.created_at.isoformat() if s.created_at else None
+        }
+        for s in subs
+    ]
+
+
+class CreateWebhookSubscriptionRequest(BaseModel):
+    url: str
+    event_types: list[str]
+    organization_id: Optional[str] = None
+
+
+@router.post("/webhook-subscriptions")
+async def create_webhook_subscription(
+    req: CreateWebhookSubscriptionRequest,
+    db: AsyncSession = Depends(get_db),
+    admin: User = Depends(require_admin),
+):
+    """Create a new webhook subscription."""
+    import secrets
+    secret = f"whsec_{secrets.token_hex(16)}"
+    new_sub = WebhookSubscription(
+        url=req.url,
+        secret=secret,
+        event_types=req.event_types,
+        organization_id=req.organization_id,
+        is_active=True
+    )
+    db.add(new_sub)
+    await db.commit()
+    
+    await write_audit_log(
+        db=db,
+        action="create_webhook",
+        resource_type="webhook",
+        resource_id=new_sub.id,
+        user_id=admin.id,
+        details={"url": req.url, "event_types": req.event_types}
+    )
+    await db.commit()
+    
+    return {
+        "id": new_sub.id,
+        "url": new_sub.url,
+        "secret": new_sub.secret,
+        "event_types": new_sub.event_types,
+        "created_at": new_sub.created_at.isoformat() if new_sub.created_at else None
+    }
+
+
+@router.put("/webhook-subscriptions/{sub_id}/toggle")
+async def toggle_webhook_subscription(
+    sub_id: str,
+    db: AsyncSession = Depends(get_db),
+    admin: User = Depends(require_admin),
+):
+    """Toggle a webhook subscription active state."""
+    result = await db.execute(select(WebhookSubscription).where(WebhookSubscription.id == sub_id))
+    sub = result.scalar_one_or_none()
+    if not sub:
+        raise HTTPException(status_code=404, detail="Webhook subscription not found")
+    
+    sub.is_active = not sub.is_active
+    await db.commit()
+    
+    await write_audit_log(
+        db=db,
+        action="toggle_webhook",
+        resource_type="webhook",
+        resource_id=sub_id,
+        user_id=admin.id,
+        details={"is_active": sub.is_active}
+    )
+    await db.commit()
+    
+    return {"ok": True, "is_active": sub.is_active}
+
+
+@router.delete("/webhook-subscriptions/{sub_id}")
+async def delete_webhook_subscription(
+    sub_id: str,
+    db: AsyncSession = Depends(get_db),
+    admin: User = Depends(require_admin),
+):
+    """Delete a webhook subscription."""
+    result = await db.execute(select(WebhookSubscription).where(WebhookSubscription.id == sub_id))
+    sub = result.scalar_one_or_none()
+    if not sub:
+        raise HTTPException(status_code=404, detail="Webhook subscription not found")
+    
+    await db.delete(sub)
+    await db.commit()
+    
+    await write_audit_log(
+        db=db,
+        action="delete_webhook",
+        resource_type="webhook",
+        resource_id=sub_id,
+        user_id=admin.id,
+        details={"url": sub.url}
+    )
+    await db.commit()
+    
+    return {"ok": True}
+
+
+DEFAULT_ROLE_PERMISSIONS = {
+    "student": ["documents:read", "chats:create"],
+    "ta": ["documents:read", "chats:create", "courses:read"],
+    "faculty": ["documents:read", "documents:write", "chats:create", "courses:read", "courses:write", "web_search:use"],
+    "admin": [
+        "documents:read", "documents:write", "documents:delete",
+        "courses:read", "courses:write", "chats:create", "chats:delete",
+        "web_search:use", "custom_models:use", "org:edit_settings", "org:manage_billing"
+    ]
+}
+
+
+@router.get("/security/roles")
+async def get_role_permissions(
+    admin: User = Depends(require_admin),
+):
+    """Get the visual RBAC role-permission matrix."""
+    from app.services.cache import cache_get
+    matrix = await cache_get("security:role_permissions")
+    if not matrix:
+        matrix = DEFAULT_ROLE_PERMISSIONS
+    return matrix
+
+
+class UpdateRolePermissionsRequest(BaseModel):
+    matrix: dict
+
+
+@router.post("/security/roles")
+async def update_role_permissions(
+    req: UpdateRolePermissionsRequest,
+    db: AsyncSession = Depends(get_db),
+    admin: User = Depends(require_admin),
+):
+    """Update the RBAC role-permission matrix."""
+    from app.services.cache import cache_set
+    await cache_set("security:role_permissions", req.matrix, ttl=31536000)
+    
+    await write_audit_log(
+        db=db,
+        action="update_rbac",
+        resource_type="security",
+        resource_id="rbac_matrix",
+        user_id=admin.id,
+        details={"matrix": req.matrix}
+    )
+    await db.commit()
+    
+    return {"ok": True, "matrix": req.matrix}
+
+
 # ── WebSocket Events ───────────────────────────────────────
 
 @router.websocket("/ws/events")
@@ -2166,20 +2939,119 @@ async def admin_ws_events(ws: WebSocket):
     token = ws.headers.get("authorization") or ws.query_params.get("token", "")
     token = token.replace("Bearer ", "")
     payload = decode_token(token)
-    if not payload or payload.get("role") != "admin":
+    if not payload:
         await ws.send_json({"event": "error", "data": {"detail": "Admin authentication required"}})
         await ws.close()
         return
 
+    user_id = payload.get("sub")
+    async with AsyncSessionLocal() as db:
+        result = await db.execute(select(User).where(User.id == user_id))
+        user = result.scalar_one_or_none()
+        if not user or user.role != "admin":
+            await ws.send_json({"event": "error", "data": {"detail": "Admin authentication required"}})
+            await ws.close()
+            return
+
     await admin_ws_manager.connect(ws)
     logger.info("Admin WS connected", admin_id=payload.get("sub"))
 
+    # ── Push initial snapshot on connect ─────────────────
+    try:
+        async with AsyncSessionLocal() as db:
+            # Quick stats snapshot
+            user_count = (await db.execute(select(func.count(User.id)))).scalar() or 0
+            doc_count = (await db.execute(select(func.count(Document.id)))).scalar() or 0
+            failed_docs = (await db.execute(
+                select(func.count(Document.id)).where(Document.status == "failed")
+            )).scalar() or 0
+            msg_count = (await db.execute(select(func.count(Message.id)))).scalar() or 0
+            storage_bytes = (await db.execute(select(func.sum(Document.file_size)))).scalar() or 0
+
+            await ws.send_json({
+                "event": "snapshot",
+                "data": {
+                    "users": user_count,
+                    "documents": doc_count,
+                    "failed_docs": failed_docs,
+                    "messages": msg_count,
+                    "storage_bytes": storage_bytes,
+                    "ts": datetime.utcnow().isoformat() + "Z",
+                },
+            })
+
+            # Recent audit tail (last 20 entries)
+            recent_audit = (await db.execute(
+                select(AuditLog).order_by(AuditLog.created_at.desc()).limit(20)
+            )).scalars().all()
+
+            await ws.send_json({
+                "event": "audit:tail",
+                "data": {
+                    "entries": [
+                        {
+                            "id": e.id,
+                            "action": e.action,
+                            "resource_type": e.resource_type,
+                            "resource_id": e.resource_id,
+                            "user_id": e.user_id,
+                            "details": e.details,
+                            "ip_address": e.ip_address,
+                            "created_at": e.created_at.isoformat() + "Z",
+                        }
+                        for e in reversed(recent_audit)
+                    ]
+                },
+            })
+
+            # Run alert check and emit any active alerts
+            from app.services.event_bus import check_and_emit_alerts
+            latency_rows = (await db.execute(
+                select(Message.latency_ms)
+                .where(Message.latency_ms.isnot(None))
+                .order_by(Message.latency_ms)
+            )).scalars().all()
+            lat_count = len(latency_rows)
+            await check_and_emit_alerts({
+                "failed_ingestions": failed_docs,
+                "documents": doc_count,
+                "storage_bytes": storage_bytes or 0,
+                "latency_p95": latency_rows[int(lat_count * 0.95)] if lat_count > 0 else None,
+            })
+
+    except Exception as e:
+        logger.warning("WS initial snapshot failed", error=str(e))
+
+    # ── Message loop ──────────────────────────────────────
     try:
         while True:
             data = await ws.receive_text()
-            # Pong keepalive
             if data == "ping":
                 await ws.send_json({"event": "pong"})
+            elif data == "refresh:stats":
+                # Admin requested a stats refresh
+                try:
+                    async with AsyncSessionLocal() as db:
+                        user_count = (await db.execute(select(func.count(User.id)))).scalar() or 0
+                        doc_count = (await db.execute(select(func.count(Document.id)))).scalar() or 0
+                        failed_docs = (await db.execute(
+                            select(func.count(Document.id)).where(Document.status == "failed")
+                        )).scalar() or 0
+                        msg_count = (await db.execute(select(func.count(Message.id)))).scalar() or 0
+                        storage_bytes = (await db.execute(select(func.sum(Document.file_size)))).scalar() or 0
+                        await ws.send_json({
+                            "event": "snapshot",
+                            "data": {
+                                "users": user_count,
+                                "documents": doc_count,
+                                "failed_docs": failed_docs,
+                                "messages": msg_count,
+                                "storage_bytes": storage_bytes,
+                                "ts": datetime.utcnow().isoformat() + "Z",
+                            },
+                        })
+                except Exception as e:
+                    logger.warning("WS refresh:stats failed", error=str(e))
     except WebSocketDisconnect:
         admin_ws_manager.disconnect(ws)
         logger.info("Admin WS disconnected")

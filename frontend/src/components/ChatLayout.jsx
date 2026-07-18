@@ -44,7 +44,7 @@ const mobileNavItems = [
   { to: '/study',     icon: Zap,           label: 'Study' },
 ]
 
-const CitationPanel = memo(function CitationPanel({ citations }) {
+const CitationPanel = memo(function CitationPanel({ citations, messageId }) {
   if (!citations?.length) return null
   return (
     <div style={{ marginTop: '.75rem', borderTop: '1px solid var(--border)', paddingTop: '.75rem' }}>
@@ -52,7 +52,15 @@ const CitationPanel = memo(function CitationPanel({ citations }) {
       <div className="flex gap-2" style={{ flexWrap: 'wrap' }}>
         {citations.map((c) => (
           <div key={c.index} className="tooltip-wrap">
-            <span className="citation-chip">
+            <span
+              className="citation-chip"
+              onClick={() => {
+                if (messageId) {
+                  chatApi.recordClick(messageId, c.index).catch(() => {})
+                }
+              }}
+              style={{ cursor: 'pointer' }}
+            >
               <span className="citation-num">{c.index}</span>
               <span className="truncate" style={{ maxWidth: 120 }}>{c.filename}</span>
               {c.page_number && <span style={{ color: 'var(--text-muted)', fontSize: '.65rem' }}>p.{c.page_number}</span>}
@@ -100,7 +108,7 @@ const MessageBubble = memo(function MessageBubble({ msg, onFeedback }) {
                   <span style={{ fontSize: '.7rem', color: 'var(--text-muted)' }}>{Math.round(msg.confidence * 100)}%</span>
                 </div>
               )}
-              <CitationPanel citations={msg.citations} />
+              <CitationPanel citations={msg.citations} messageId={msg.id} />
               {msg.metadata?.follow_up_questions?.length > 0 && (
                 <div className="flex" style={{ gap: '.4rem', flexWrap: 'wrap', marginTop: '.75rem' }}>
                   {msg.metadata.follow_up_questions.map((q, i) => (

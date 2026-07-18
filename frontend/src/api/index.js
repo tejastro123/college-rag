@@ -97,6 +97,7 @@ export const chatApi = {
   deleteConversation: (id) => api.delete(`/chat/conversations/${id}`),
   bookmarkConversation: (id) => api.post(`/chat/conversations/${id}/bookmark`),
   messageFeedback: (id, rating) => api.post(`/chat/messages/${id}/feedback`, { rating }),
+  recordClick: (messageId, clickRank) => api.post('/search/click', { message_id: messageId, click_rank: clickRank }),
 }
 
 // Courses

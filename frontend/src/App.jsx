@@ -46,6 +46,58 @@ function AdminRoute({ children }) {
 
 import { useEffect } from 'react'
 
+function ImpersonationBanner() {
+  const setAuth = useAuthStore((s) => s.setAuth)
+  const user = useAuthStore((s) => s.user)
+  const hasOriginal = !!localStorage.getItem('rag-admin-original-auth')
+
+  if (!hasOriginal) return null
+
+  const handleReturn = () => {
+    try {
+      const orig = JSON.parse(localStorage.getItem('rag-admin-original-auth'))
+      if (orig && orig.token && orig.user) {
+        setAuth(orig.token, orig.user)
+        localStorage.removeItem('rag-admin-original-auth')
+        window.location.href = '/admin'
+      }
+    } catch (e) {
+      localStorage.removeItem('rag-admin-original-auth')
+      window.location.href = '/login'
+    }
+  }
+
+  return (
+    <div style={{
+      background: 'linear-gradient(90deg, #b45309, #d97706)',
+      color: '#fff',
+      padding: '.5rem 1rem',
+      fontSize: '.8rem',
+      fontWeight: 600,
+      display: 'flex',
+      alignItems: 'center',
+      justifyContent: 'center',
+      gap: '1rem',
+      zIndex: 9999,
+      position: 'relative'
+    }}>
+      <span>⚠️ You are impersonating user <strong>{user?.full_name || user?.email}</strong> ({user?.role})</span>
+      <button onClick={handleReturn} style={{
+        background: '#fff',
+        color: '#b45309',
+        border: 'none',
+        padding: '2px 8px',
+        borderRadius: 4,
+        cursor: 'pointer',
+        fontSize: '.75rem',
+        fontWeight: 700
+      }}>
+        Return to Admin Dashboard
+      </button>
+    </div>
+  )
+}
+
 export default function App() {
   useEffect(() => {
     const savedTheme = localStorage.getItem('rag-theme') || 'dark'
@@ -84,6 +136,7 @@ export default function App() {
   return (
     <BrowserRouter future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
       <ToastProvider>
+        <ImpersonationBanner />
         <Suspense fallback={<PageFallback />}>
           <Routes>
             <Route path="/login" element={<LoginPage />} />

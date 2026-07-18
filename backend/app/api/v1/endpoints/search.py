@@ -1,7 +1,8 @@
-"""Full-text search endpoints for documents and courses."""
+"""Full-text search endpoints for documents and courses, and search click tracking."""
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.logging import get_logger
@@ -12,6 +13,11 @@ from app.services.search import search_documents, search_courses, search_all
 
 logger = get_logger(__name__)
 router = APIRouter(prefix="/search", tags=["Search"])
+
+
+class SearchClickRequest(BaseModel):
+    message_id: str
+    click_rank: int
 
 
 @router.get("/")
@@ -51,3 +57,19 @@ async def search_crs(
 ):
     results = await search_courses(db, q, user_id=current_user.id)
     return results
+
+
+@router.post("/click")
+async def record_click(
+    request: SearchClickRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Record a click action on a search result citation."""
+    try:
+        from app.services.search_tuning import record_search_click
+        await record_search_click(db, request.message_id, request.click_rank)
+    except Exception as e:
+        logger.error("Failed to record click", error=str(e))
+        raise HTTPException(status_code=500, detail="Failed to record search click")
+    return {"ok": True}
